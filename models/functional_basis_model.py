@@ -18,6 +18,8 @@ class FunctionalBasisAffordanceModel(LASModel):
         super().__init__(config)
         if self.prompt_type != "visual":
             raise ValueError("The functional-basis MVP currently supports visual prompts only")
+        if self.point_only:
+            raise ValueError("The functional-basis model requires a visual prompt encoder")
 
         model_config = config["model"]
         self.functional_basis_head = RelationalAffordanceHead(

@@ -32,13 +32,23 @@ class LASModel(nn.Module):
         
         # Determine prompt type: 'visual' or 'text'
         self.prompt_type = config['model'].get('prompt_type', 'visual')
-        
+
+        # Eval-time visual prompt ablation: 'none' | 'drop' (point-only forward).
+        # 'shuffle' is handled at data level in the trainer's validate loop.
+        self.ablate_prompt = str(config.get('ablate_prompt', 'none') or 'none').lower()
+        # Training-time point-only model: the prompt branch is never built or used.
+        self.point_only = bool(config['model'].get('point_only', False))
+        self.skip_prompt = self.point_only or self.ablate_prompt == 'drop'
+
         # Initialize point encoder (always needed)
         self.point_encoder = PointMAEEncoder(config=config['model']['point_encoder'])
         self.point_feature_dim = self.point_encoder.trans_dim
-        
+
         # Initialize prompt encoder based on type
-        if self.prompt_type == 'visual':
+        if self.point_only:
+            self.prompt_encoder = None
+            self.prompt_projection = None
+        elif self.prompt_type == 'visual':
             # Visual prompt encoder (DINOv2/v3)
             self.prompt_encoder = DinoImageEncoder(
                 model_name=config['model']['image_encoder']['model_name'],
@@ -66,8 +76,9 @@ class LASModel(nn.Module):
         self.unified_dim = config['model']['unified_sequence']['unified_dim']
         
         # Feature projection layers to unified dimension
-        self.prompt_projection = nn.Linear(self.prompt_feature_dim, self.unified_dim)
         self.point_projection = nn.Linear(self.point_feature_dim, self.unified_dim)
+        if not self.point_only:
+            self.prompt_projection = nn.Linear(self.prompt_feature_dim, self.unified_dim)
         
         # Modality type embeddings
         self.point_type_embedding = nn.Parameter(torch.randn(1, 1, self.unified_dim))
@@ -106,10 +117,11 @@ class LASModel(nn.Module):
         nn.init.normal_(self.prompt_type_embedding, std=0.02)
         
         # Initialize projection layers
-        nn.init.xavier_uniform_(self.prompt_projection.weight)
         nn.init.xavier_uniform_(self.point_projection.weight)
-        nn.init.constant_(self.prompt_projection.bias, 0)
         nn.init.constant_(self.point_projection.bias, 0)
+        if self.prompt_projection is not None:
+            nn.init.xavier_uniform_(self.prompt_projection.weight)
+            nn.init.constant_(self.prompt_projection.bias, 0)
 
     def encode_points(self, points):
         """Encode a point cloud without conditioning it on a prompt."""
@@ -140,6 +152,8 @@ class LASModel(nn.Module):
 
     def encode_prompts(self, images=None, texts=None):
         """Encode and project visual or text prompt tokens."""
+        if self.prompt_encoder is None or self.prompt_projection is None:
+            raise ValueError("Prompt encoding is unavailable in point-only mode")
         if self.prompt_type == 'visual':
             if images is None:
                 raise ValueError("images are required for a visual prompt encoder")
@@ -195,7 +209,10 @@ class LASModel(nn.Module):
         
         # Encode prompts based on type
         prompt_attention_mask = None
-        if self.prompt_type == 'visual':
+        prompt_features = None
+        if self.skip_prompt:
+            pass  # point-only forward: prompt branch skipped entirely
+        elif self.prompt_type == 'visual':
             images = batch['image']  # (B, 3, H, W)
             prompt_features = self.prompt_encoder(images)  # (B, H*W, prompt_feature_dim)
             # For visual prompts, all tokens are valid (no padding)
@@ -203,9 +220,9 @@ class LASModel(nn.Module):
         elif self.prompt_type == 'text':
             texts = batch['text']  # List of strings
             prompt_features, prompt_attention_mask = self.prompt_encoder(texts)  # (B, seq_len, prompt_feature_dim), (B, seq_len)
-        
+
         # Project to unified dimension
-        prompt_features_proj = self.prompt_projection(prompt_features)
+        prompt_features_proj = self.prompt_projection(prompt_features) if prompt_features is not None else None
         point_features_proj = self.point_projection(point_group_features)
         
         # Upsample point features
@@ -307,22 +324,33 @@ class LASModel(nn.Module):
         
         # Add modality type embeddings
         point_features_with_type = upsampled_point_features + self.point_type_embedding.expand(B, N, -1)
-        prompt_features_with_type = prompt_features_proj + self.prompt_type_embedding.expand(B, prompt_features_proj.size(1), -1)
-        
-        # Create unified sequence
-        unified_sequence = torch.cat([point_features_with_type, prompt_features_with_type], dim=1)
-        
-        # Create unified attention mask
-        # Point cloud tokens are always valid (no padding)
         point_attention_mask = torch.ones(B, N, device=points.device)
-        unified_attention_mask = torch.cat([point_attention_mask, prompt_attention_mask], dim=1)
-        
-        # Apply co-attentional transformer with attention mask
-        fused_sequence = self.co_attention_transformer(unified_sequence, src_key_padding_mask=(unified_attention_mask == 0))
-        
-        # Split back to point and prompt features
-        fused_point_features = fused_sequence[:, :N, :]
-        fused_prompt_features = fused_sequence[:, N:, :]
+
+        if prompt_features_proj is None:
+            # Ablated point-only forward: co-attention runs on point tokens alone.
+            # (Not implemented via key-padding mask: fully-masked prompt rows produce
+            # NaN in softmax and 0*NaN would leak NaN into point rows in deeper layers.)
+            fused_sequence = self.co_attention_transformer(
+                point_features_with_type,
+                src_key_padding_mask=(point_attention_mask == 0)
+            )
+            fused_point_features = fused_sequence[:, :N, :]
+            fused_prompt_features = None
+        else:
+            prompt_features_with_type = prompt_features_proj + self.prompt_type_embedding.expand(B, prompt_features_proj.size(1), -1)
+
+            # Create unified sequence
+            unified_sequence = torch.cat([point_features_with_type, prompt_features_with_type], dim=1)
+
+            # Create unified attention mask
+            unified_attention_mask = torch.cat([point_attention_mask, prompt_attention_mask], dim=1)
+
+            # Apply co-attentional transformer with attention mask
+            fused_sequence = self.co_attention_transformer(unified_sequence, src_key_padding_mask=(unified_attention_mask == 0))
+
+            # Split back to point and prompt features
+            fused_point_features = fused_sequence[:, :N, :]
+            fused_prompt_features = fused_sequence[:, N:, :]
         
         # Generate segmentation predictions
         segmentation_logits = self.segmentation_head(fused_point_features)
@@ -348,13 +376,14 @@ class DinoImageEncoder(nn.Module):
         super().__init__()
         self.model_name = model_name
         self.is_dinov3 = 'dinov3' in model_name
+        self.is_dinov2_hf = False  # True if DINOv2 loaded via HuggingFace (transformers)
         self.apply_post_layernorm = False  # only enable for DINOv3 by default
 
         if self.is_dinov3:
             # --- DINOv3 loading via torch.hub ---
             if dino_local_repo is None or dino_local_weights_name is None:
                 raise ValueError("`dino_local_repo` and `dino_local_weights_name` must be provided for DINOv3.")
-            
+
             weights_path = os.path.join(dino_local_repo, dino_local_weights_name)
             self.dino_model = torch.hub.load(dino_local_repo, model_name, source='local', weights=weights_path)
             self.feature_dim = self.dino_model.embed_dim
@@ -363,12 +392,41 @@ class DinoImageEncoder(nn.Module):
             self.apply_post_layernorm = bool(apply_post_layernorm)
 
         else:
-            # --- DINOv2 loading via transformers ---
-            self.dino_model = AutoModel.from_pretrained(model_name)
-            self.feature_dim = self.dino_model.config.hidden_size
-            print(f"Loaded DINOv2 model '{model_name}' from HuggingFace transformers.")
-            # Keep post LayerNorm disabled for DINOv2 by default
-            self.apply_post_layernorm = False
+            # --- DINOv2 loading ---
+            # Try torch.hub from local cache first (same API as DINOv3)
+            _torch_hub_repo = os.path.expanduser('~/.cache/torch/hub/facebookresearch_dinov2_main')
+            _torch_hub_weights = os.path.expanduser('~/.cache/torch/hub/checkpoints/dinov2_vitb14_pretrain.pth')
+            if os.path.isdir(_torch_hub_repo) and os.path.isfile(_torch_hub_weights):
+                # Map model name to weight file name
+                # Map config model name -> (torch.hub model name, weight file name)
+                _name_map = {
+                    'facebook/dinov2-vitb14': ('dinov2_vitb14', 'dinov2_vitb14_pretrain.pth'),
+                    'dinov2_vitb14': ('dinov2_vitb14', 'dinov2_vitb14_pretrain.pth'),
+                    'dinov2_vits14': ('dinov2_vits14', 'dinov2_vits14_pretrain.pth'),
+                    'facebook/dinov2-vits14': ('dinov2_vits14', 'dinov2_vits14_pretrain.pth'),
+                    'dinov2_vitl14': ('dinov2_vitl14', 'dinov2_vitl14_pretrain.pth'),
+                    'facebook/dinov2-vitl14': ('dinov2_vitl14', 'dinov2_vitl14_pretrain.pth'),
+                }
+                _hub_name, _weight_name = _name_map.get(model_name, (None, None))
+                _weight_path = os.path.join(os.path.expanduser('~/.cache/torch/hub/checkpoints'), _weight_name) if _weight_name else None
+                if _weight_path and os.path.isfile(_weight_path):
+                    self.dino_model = torch.hub.load(_torch_hub_repo, _hub_name, source='local', weights=_weight_path)
+                    self.feature_dim = self.dino_model.embed_dim
+                    print(f"Loaded DINOv2 model '{model_name}' from local torch.hub cache: {_torch_hub_repo}")
+                else:
+                    # Fallback to HuggingFace
+                    self.dino_model = AutoModel.from_pretrained(model_name)
+                    self.feature_dim = self.dino_model.config.hidden_size
+                    self.is_dinov2_hf = True
+                    print(f"Loaded DINOv2 model '{model_name}' from HuggingFace transformers.")
+                    self.apply_post_layernorm = False
+            else:
+                # No local torch.hub cache, use HuggingFace
+                self.dino_model = AutoModel.from_pretrained(model_name)
+                self.feature_dim = self.dino_model.config.hidden_size
+                self.is_dinov2_hf = True
+                print(f"Loaded DINOv2 model '{model_name}' from HuggingFace transformers.")
+                self.apply_post_layernorm = False
 
         # Post feature normalization (only constructed if used)
         if self.apply_post_layernorm:
@@ -387,19 +445,19 @@ class DinoImageEncoder(nn.Module):
                 param.requires_grad = False
             
             # Unfreeze the last 'finetune_layers' based on model type
-            if self.is_dinov3 and hasattr(self.dino_model, 'blocks'):
-                # DINOv3 from torch.hub
+            if (self.is_dinov3 or (not self.is_dinov3 and not self.is_dinov2_hf)) and hasattr(self.dino_model, 'blocks'):
+                # DINOv3 or DINOv2 from torch.hub (both have .blocks)
                 total_layers = len(self.dino_model.blocks)
                 freeze_layers = max(0, total_layers - finetune_layers)
                 for i in range(freeze_layers, total_layers):
                     for param in self.dino_model.blocks[i].parameters():
                         param.requires_grad = True
-                
+
                 # Unfreeze registers if they exist
                 if hasattr(self.dino_model, 'reg_tokens'):
                     self.dino_model.reg_tokens.requires_grad = True
 
-            elif not self.is_dinov3 and hasattr(self.dino_model, 'encoder') and hasattr(self.dino_model.encoder, 'layer'):
+            elif self.is_dinov2_hf and hasattr(self.dino_model, 'encoder') and hasattr(self.dino_model.encoder, 'layer'):
                 # DINOv2 from transformers
                 total_layers = len(self.dino_model.encoder.layer)
                 freeze_layers = max(0, total_layers - finetune_layers)
@@ -423,8 +481,8 @@ class DinoImageEncoder(nn.Module):
         Returns:
             features: (B, num_patches, feature_dim) patch features
         """
-        if self.is_dinov3:
-            # DINOv3 torch.hub API
+        if self.is_dinov3 or (not self.is_dinov2_hf):
+            # DINOv3 or DINOv2 from torch.hub (same API)
             output = self.dino_model.forward_features(images)
             if isinstance(output, dict) and 'x_norm_patchtokens' in output:
                 features = output['x_norm_patchtokens']

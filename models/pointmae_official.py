@@ -2,7 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
-from timm.layers import DropPath, trunc_normal_
+try:
+    from timm.layers import DropPath, trunc_normal_
+except ImportError:
+    from timm.models.layers import DropPath, trunc_normal_
 import numpy as np
 from .build import MODELS
 from utils import misc

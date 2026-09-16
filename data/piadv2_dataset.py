@@ -30,22 +30,25 @@ class PIADV2Dataset(Dataset):
     - 'instance_id': unique ID for different 3D models
     """
     
-    def __init__(self, 
-                 run_type='train', 
+    def __init__(self,
+                 run_type='train',
                  setting_type='Seen',
                  point_path=None,
                  img_path=None,
                  image_size=(224, 224),
                  num_points=2048,
-                 use_augmentation=True):
-        
+                 use_augmentation=True,
+                 data_root=None,
+                 text_source='affordance_word'):
+
         super().__init__()
-        
+
         self.run_type = run_type
         self.setting_type = setting_type
         self.image_size = image_size
         self.num_points = num_points
         self.use_augmentation = use_augmentation
+        self.text_source = text_source
         
         # PIADv2 affordance categories (24 classes)
         self.affordance_label_list = [
@@ -58,6 +61,20 @@ class PIADV2Dataset(Dataset):
         # Load file paths
         self.img_files = self._read_file_list(img_path)
         self.point_files = self._read_file_list(point_path)
+
+        # Load natural-language text prompts (hk/ok) if requested;
+        # default 'affordance_word' uses bare affordance label (no file needed).
+        self.text_list = None
+        if self.text_source in ('hk', 'ok') and data_root is not None:
+            split_suffix = 'train' if run_type == 'train' else 'test'
+            text_file = os.path.join(data_root, f'{self.text_source}_{split_suffix}.txt')
+            print(f"[PIADV2Dataset] Loading text prompts from: {text_file}")
+            with open(text_file, 'r', encoding='utf-8') as f:
+                self.text_list = [line.rstrip('\n') for line in f if line.strip()]
+            if len(self.text_list) != len(self.img_files):
+                print(f"[PIADV2Dataset] WARNING: text list length {len(self.text_list)} != "
+                      f"img list length {len(self.img_files)}")
+            print(f"[PIADV2Dataset] Sample text: {self.text_list[0][:120]}")
 
         # Debug: print a few resolved paths to help diagnose path issues
         if len(self.img_files) > 0:
@@ -121,13 +138,16 @@ class PIADV2Dataset(Dataset):
         # Get affordance and instance IDs
         affordance_id = self._get_affordance_id(img_path)
         instance_id = self._get_instance_id(img_path)
-        
+
         return {
             'image': image,
             'points': torch.from_numpy(points).float(),
             'gt_mask': torch.from_numpy(gt_mask).float(),
             'affordance_id': affordance_id,
-            'instance_id': instance_id
+            'instance_id': instance_id,
+            # text prompt: natural-language description (hk/ok) or bare affordance word
+            'text': self.text_list[index] if self.text_list is not None
+                   else self.affordance_label_list[affordance_id]
         }
     
     def _read_file_list(self, path):
@@ -183,6 +203,25 @@ class PIADV2Dataset(Dataset):
                             if os.path.exists(candidate2):
                                 resolved_path = candidate2
                         
+                        # 3. 尝试相对于 txt 文件所在目录解析
+                        if resolved_path is None:
+                            list_dir = os.path.dirname(path)
+                            # 去掉 "Data/" 前缀，从 list_dir 的父目录解析
+                            # txt 在 data_root/ 下，路径如 Data/Unseen_obj/... → 去掉 Data/ 后从 data_root 的父目录拼接
+                            if line.startswith('Data/'):
+                                parent_dir = os.path.dirname(list_dir)
+                                alt = os.path.join(parent_dir, line[len('Data/'):])
+                            else:
+                                alt = os.path.join(list_dir, line)
+                            if os.path.exists(alt):
+                                resolved_path = alt
+
+                        # 4. 尝试相对于 txt 文件所在目录解析（完整路径）
+                        if resolved_path is None:
+                            alt2 = os.path.join(list_dir, line)
+                            if os.path.exists(alt2):
+                                resolved_path = alt2
+
                         # 如果所有策略都失败，使用原始路径（让错误暴露出来）
                         if resolved_path is None:
                             resolved_path = candidate1
@@ -385,7 +424,9 @@ def get_dataloader(config, split='train'):
         img_path=img_path,
         image_size=config['data']['image_size'],
         num_points=config['data']['num_points'],
-        use_augmentation=use_augmentation
+        use_augmentation=use_augmentation,
+        data_root=data_root,
+        text_source=config.get('data', {}).get('text_source', 'affordance_word')
     )
     
     # Create dataloader

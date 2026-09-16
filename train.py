@@ -17,6 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from tqdm import tqdm
 import argparse
+import logging
 from datetime import datetime
 
 # Add project root to path
@@ -197,7 +198,9 @@ class UnifiedTrainer:
         self.rank = rank
         self.world_size = world_size
         self.is_distributed = world_size > 1
-        
+        # Eval-time visual prompt ablation: 'none' | 'shuffle' | 'drop'
+        self.ablate_prompt = str(config.get('ablate_prompt', 'none') or 'none').lower()
+
         # Setup device
         if self.is_distributed:
             self.device = torch.device(f'cuda:{rank}')
@@ -216,9 +219,45 @@ class UnifiedTrainer:
         
         # Create unique experiment directory (only on rank 0)
         if rank == 0:
+            name = self.config['name']
             model_name = self.config['model']['name']
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.exp_name = f"{model_name}_{timestamp}"
+            # 数据集名：优先用 dataset_type，缺失时回退到 data_root 的末级目录名
+            dataset_name = self.config.get("dataset_type")
+            if not dataset_name:
+                dataset_name = os.path.basename(
+                    os.path.normpath(self.config["paths"].get("data_root", "data")))
+            dataset_name = str(dataset_name).lower().replace("-", "_").replace(" ", "_")
+
+            # 数据集类型（seen / unseen_obj）：优先取 setting_type / eval_setting，
+            # 缺失时从 data_root 路径里推断
+            dataset_split = (self.config.get("setting_type")
+                             or self.config.get("eval_setting")
+                             or "").strip().lower()
+            if not dataset_split:
+                data_root = self.config["paths"].get("data_root", "")
+                for tok in os.path.normpath(data_root).split(os.sep):
+                    t = tok.lower()
+                    if t.startswith("seen") or t.startswith("unseen"):
+                        dataset_split = t
+                        break
+            if dataset_split == "unseen":
+                # PIADv1 风格的裸 "Unseen" 归一为 unseen_obj；保留 unseen_obj / unseen_aff 原样
+                dataset_split = "unseen_obj"
+
+            prompt_type = str(self.config.get('model', {}).get('prompt_type', 'visual') or 'visual').lower()
+            if self.config.get('model', {}).get('point_only', False):
+                ablate_suffix = "_pointonly"
+            elif prompt_type != 'visual':
+                ablate_suffix = f"_{prompt_type}prompt"
+            elif self.ablate_prompt != 'none':
+                ablate_suffix = f"_ablate-{self.ablate_prompt}"
+            else:
+                ablate_suffix = ""
+            if dataset_split:
+                self.exp_name = f"{name}_{dataset_name}_{dataset_split}{ablate_suffix}_{timestamp}"
+            else:
+                self.exp_name = f"{name}_{dataset_name}{ablate_suffix}_{timestamp}"
             
             self.exp_dir = os.path.join(self.config['paths']['checkpoint_dir'], self.exp_name)
             self.log_dir = os.path.join(self.config['paths']['log_dir'], self.exp_name)
@@ -343,8 +382,11 @@ class UnifiedTrainer:
         
         # LAS uses different learning rates for the prompt encoder and Point-MAE encoder.
         if self.config['model']['name'] == 'las':
-            # Get prompt encoder parameters (either visual or text)
-            prompt_params = [p for p in model_module.prompt_encoder.parameters() if p.requires_grad]
+            # Get prompt encoder parameters (either visual or text; absent for point-only models)
+            if getattr(model_module, 'prompt_encoder', None) is not None:
+                prompt_params = [p for p in model_module.prompt_encoder.parameters() if p.requires_grad]
+            else:
+                prompt_params = []
             
             # Group 2: Point-MAE parameters (LR * 0.2)
             pointmae_params = list(model_module.point_encoder.parameters())
@@ -367,6 +409,8 @@ class UnifiedTrainer:
                 {'params': pointmae_params, 'lr': lr * 0.2, 'name': 'point_encoder'},
                 {'params': other_params, 'lr': lr, 'name': 'other_modules'}
             ]
+            # drop empty groups (e.g. no prompt encoder in point-only mode)
+            param_groups = [g for g in param_groups if g['params']]
 
             if self.rank == 0:
                 print(f"Optimizer configured with parameter groups for LAS ({prompt_type} prompt):")
@@ -542,9 +586,15 @@ class UnifiedTrainer:
                 
             for batch in val_iterator:
                 # Move batch to device
-                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v
                         for k, v in batch.items()}
-                
+
+                # V1 ablation: feed mismatched images to destroy image<->point
+                # correspondence while keeping token count and feature statistics
+                if self.ablate_prompt == 'shuffle' and isinstance(batch.get('image'), torch.Tensor):
+                    perm = torch.randperm(batch['image'].size(0), device=batch['image'].device)
+                    batch['image'] = batch['image'][perm]
+
                 # Forward pass
                 outputs = self.model(batch)
                 
@@ -667,9 +717,29 @@ class UnifiedTrainer:
             'mae': metrics['mae']
         }
     
+    def run_eval_only(self):
+        """Run a single evaluation pass (for prompt-ablation studies on existing checkpoints)."""
+        logging.info(f"Eval-only mode (ablate_prompt={self.ablate_prompt})")
+        val_loss, val_seg_loss, val_cont_loss, val_metrics = self.validate()
+        if self.rank == 0:
+            logging.info(f"[eval-only] ablate_prompt={self.ablate_prompt}")
+            logging.info(f"  Val Loss: {val_loss:.4f} (Focal: {val_seg_loss:.4f}, Dice: {val_cont_loss:.4f})")
+            logging.info(f"  Val aIoU: {val_metrics['aiou']:.4f}")
+            logging.info(f"  Val AUC: {val_metrics['auc']:.4f}")
+            logging.info(f"  Val SIM: {val_metrics['sim']:.4f}")
+            logging.info(f"  Val MAE: {val_metrics['mae']:.4f}")
+            if self.dataset_type == 'laso':
+                seen_unseen_results = self.validate_seen_unseen()
+                logging.info(f"  Seen/Unseen: {seen_unseen_results}")
+        print("Evaluation completed!")
+
     def train(self):
         """Main training loop"""
-        print("Starting training...")
+        if self.config.get('eval_only', False):
+            self.run_eval_only()
+            return
+
+        logging.info("Starting training...")
         
         for epoch in range(self.config['training']['epochs']):
             self.epoch = epoch
@@ -691,26 +761,26 @@ class UnifiedTrainer:
             
             # Logging (only on rank 0)
             if self.rank == 0:
-                print(f"Epoch {epoch}:")
-                print(f"  Train Loss: {train_loss:.4f} (Focal: {train_seg_loss:.4f}, Dice: {train_cont_loss:.4f})")
-                print(f"  Val Loss: {val_loss:.4f} (Focal: {val_seg_loss:.4f}, Dice: {val_cont_loss:.4f})")
-                print(f"  Val aIoU: {val_metrics['aiou']:.4f}")
-                print(f"  Val AUC: {val_metrics['auc']:.4f}")
-                print(f"  Val SIM: {val_metrics['sim']:.4f}")
-                print(f"  Val MAE: {val_metrics['mae']:.4f}")
-                
+                logging.info(f"Epoch {epoch}:")
+                logging.info(f"  Train Loss: {train_loss:.4f} (Focal: {train_seg_loss:.4f}, Dice: {train_cont_loss:.4f})")
+                logging.info(f"  Val Loss: {val_loss:.4f} (Focal: {val_seg_loss:.4f}, Dice: {val_cont_loss:.4f})")
+                logging.info(f"  Val aIoU: {val_metrics['aiou']:.4f}")
+                logging.info(f"  Val AUC: {val_metrics['auc']:.4f}")
+                logging.info(f"  Val SIM: {val_metrics['sim']:.4f}")
+                logging.info(f"  Val MAE: {val_metrics['mae']:.4f}")
+
                 # Log seen/unseen results if available
                 if seen_unseen_results:
-                    print(f"  --- LASO Seen/Unseen Results ---")
+                    logging.info(f"  --- LASO Seen/Unseen Results ---")
                     if 'seen_aiou' in seen_unseen_results:
-                        print(
+                        logging.info(
                             f"  Seen aIoU: {seen_unseen_results['seen_aiou']:.4f}, "
                             f"AUC: {seen_unseen_results['seen_auc']:.4f}, "
                             f"SIM: {seen_unseen_results.get('seen_sim', float('nan')):.4f}, "
                             f"MAE: {seen_unseen_results.get('seen_mae', float('nan')):.4f}"
                         )
                     if 'unseen_aiou' in seen_unseen_results:
-                        print(
+                        logging.info(
                             f"  Unseen aIoU: {seen_unseen_results['unseen_aiou']:.4f}, "
                             f"AUC: {seen_unseen_results['unseen_auc']:.4f}, "
                             f"SIM: {seen_unseen_results.get('unseen_sim', float('nan')):.4f}, "
@@ -788,10 +858,13 @@ def train_worker(rank, world_size, config, resume_path=None):
             
             if rank == 0:
                 print(f"Resumed from epoch {trainer.epoch}")
-        
-        # Start training
-        trainer.train()
-        
+
+        # Start training (or single eval pass)
+        if config.get('eval_only', False):
+            trainer.run_eval_only()
+        else:
+            trainer.train()
+
     finally:
         # Clean up distributed training
         cleanup_distributed()
@@ -807,12 +880,22 @@ def main():
                        help='Enable distributed training')
     parser.add_argument('--world-size', type=int, default=1,
                        help='Number of GPUs for distributed training')
-    
+    parser.add_argument('--ablate-prompt', type=str, default='none',
+                       choices=['none', 'shuffle', 'drop'],
+                       help='Eval-time visual prompt ablation: shuffle=mismatched images, '
+                            'drop=point-only forward (prompt tokens removed)')
+    parser.add_argument('--eval-only', action='store_true',
+                       help='Skip training; run one validation pass and exit '
+                            '(use with --resume on an existing checkpoint)')
+
     args = parser.parse_args()
-    
+
     # Load configuration
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
+
+    config['ablate_prompt'] = args.ablate_prompt
+    config['eval_only'] = args.eval_only
     
     # Validate model type
     supported_models = get_supported_models()
@@ -856,9 +939,12 @@ def main():
             trainer.best_val_aiou = checkpoint.get('best_val_aiou', checkpoint.get('best_val_iou', 0.0))
             trainer.best_val_loss = checkpoint['best_val_loss']
             print(f"Resumed from epoch {trainer.epoch}")
-        
-        # Start training
-        trainer.train()
+
+        # Start training (or single eval pass)
+        if config.get('eval_only', False):
+            trainer.run_eval_only()
+        else:
+            trainer.train()
 
 if __name__ == '__main__':
     main()

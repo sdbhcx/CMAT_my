@@ -116,28 +116,41 @@ def load_config(config_path):
     
     return config
 
-def create_experiment_dir(base_dir, experiment_name=None):
+def create_experiment_dir(base_dir, experiment_name=None, dataset_name=None, dataset_split=None):
     """
-    Create experiment directory with timestamp
-    
+    Create experiment directory with timestamp.
+
     Args:
         base_dir: Base directory for experiments
         experiment_name: Optional experiment name
-    
+        dataset_name: Optional dataset name appended to the directory name
+        dataset_split: Optional split label (seen / unseen_obj), appended after dataset_name
+
     Returns:
         exp_dir: Created experiment directory
     """
-    if experiment_name is None:
+    if experiment_name is not None:
+        experiment_name = str(experiment_name)
+    else:
         experiment_name = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
+
+    if dataset_name:
+        experiment_name = f"{experiment_name}_{str(dataset_name).lower().replace('-', '_').replace(' ', '_')}"
+    if dataset_split:
+        split = str(dataset_split).strip().lower()
+        # 裸 "unseen" 归一为 unseen_obj；保留 unseen_obj / unseen_aff 原样
+        if split == "unseen":
+            split = "unseen_obj"
+        experiment_name = f"{experiment_name}_{split}"
+
     exp_dir = os.path.join(base_dir, experiment_name)
     os.makedirs(exp_dir, exist_ok=True)
-    
+
     # Create subdirectories
     os.makedirs(os.path.join(exp_dir, 'checkpoints'), exist_ok=True)
     os.makedirs(os.path.join(exp_dir, 'logs'), exist_ok=True)
     os.makedirs(os.path.join(exp_dir, 'results'), exist_ok=True)
-    
+
     return exp_dir
 
 def count_parameters(model):

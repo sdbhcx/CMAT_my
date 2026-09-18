@@ -1,0 +1,85 @@
+# Functional Basis Decoder MVP on PIADv2.
+# This configuration uses the safe A=1 compatibility adapter. It trains
+# segmentation + functional-union coverage without relation losses.
+
+model:
+  name: fbd_afford
+  prompt_type: visual
+
+  image_encoder:
+    model_name: dinov2_vitb14
+    frozen: true
+    finetune_layers: 0
+
+  point_encoder:
+    embed_dim: 384
+    depth: 12
+    num_heads: 6
+    group_size: 32
+    num_group: 128
+    mask_ratio: 0.0
+    pretrain: true
+    pretrain_path: pointmae/pretrain.pth
+    frozen: true
+
+  unified_sequence:
+    unified_dim: 512
+
+  # Required while the FBD model reuses LAS encoder construction. The original
+  # co-attention and segmentation modules are removed after initialization.
+  co_attention:
+    num_heads: 8
+    num_layers: 1
+    dim_feedforward: 1024
+    dropout: 0.1
+  segmentation_head:
+    hidden_dim: 256
+    num_layers: 2
+    dropout: 0.1
+
+  num_basis: 8
+  basis_hidden_dim: 256
+  selector_hidden_dim: 256
+  selector_temperature: 0.07
+
+dataset_type: piadv2
+
+data:
+  image_size: [224, 224]
+  num_points: 2048
+  max_affordances_per_object: 1
+
+loss:
+  stage: A
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  segmentation: 1.0
+  union: 0.2
+  relation: 0.0
+  coefficient_relation: 0.0
+  basis_diversity: 0.0
+  coefficient_sparsity: 0.0
+  cross_object_correspondence: 0.0
+
+training:
+  epochs: 20
+  batch_size: 4
+  batch_size_objects: 4
+  learning_rate: 1.0e-4
+  head_lr: 1.0e-4
+  backbone_lr: 1.0e-5
+  prompt_lr: 1.0e-5
+  weight_decay: 0.05
+  optimizer: adamw
+  scheduler: cosine
+  num_workers: 4
+
+paths:
+  data_root: Data/PIADv2/Seen
+  checkpoint_dir: checkpoints
+  log_dir: logs
+
+hardware:
+  use_cuda: true
+  pin_memory: true
+  mixed_precision: false

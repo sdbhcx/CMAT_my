@@ -354,6 +354,21 @@ Resume from a checkpoint:
 python train.py --config configs/las_visual_config.yaml --resume checkpoints/<exp_name>/checkpoint.pth
 ```
 
+### Functional Basis MVP training
+
+Update `paths.data_root` and `model.point_encoder.pretrain_path` in
+`configs/piadv2_fbd.yaml`, then run:
+
+```bash
+python train.py --config configs/piadv2_fbd.yaml
+```
+
+The MVP safely adapts each existing PIAD/PIADv2 sample to an object-shaped batch
+with one affordance (`A=1`) and trains segmentation plus functional-union
+coverage. It does not fabricate object-level cross-affordance pairs. Relation
+losses and true `A>1` training must remain disabled until an audited object index
+is available.
+
 Training outputs:
 
 - checkpoints are written to `checkpoints/<model_name>_<timestamp>/`

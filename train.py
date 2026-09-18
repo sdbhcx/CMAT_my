@@ -26,6 +26,7 @@ from models import create_model, get_loss_function, get_supported_models
 from data.piadv2_dataset import get_dataloader as get_piadv2_dataloader
 from data.piad_dataset import get_piad_dataloader
 from data.laso_dataset import get_laso_dataloader
+from data.multi_affordance_dataset import get_fbd_dataloader
 from utils.metrics import compute_metrics
 from utils.utils import save_checkpoint, load_checkpoint, setup_logging
 
@@ -263,8 +264,24 @@ class UnifiedTrainer:
             dataset_type = 'piadv2'
 
         self.dataset_type = dataset_type
-        
-        if self.is_distributed:
+
+        is_fbd = str(config['model']['name']).lower() == 'fbd_afford'
+        if is_fbd:
+            self.train_loader, self.train_sampler = get_fbd_dataloader(
+                config,
+                split='train',
+                rank=rank,
+                world_size=world_size,
+            )
+            self.val_loader, self.val_sampler = get_fbd_dataloader(
+                config,
+                split='test',
+                rank=rank,
+                world_size=world_size,
+            )
+            self.val_loader_seen = None
+            self.val_loader_unseen = None
+        elif self.is_distributed:
             self.train_loader, self.train_sampler = get_distributed_dataloader(
                 config, split='train', rank=rank, world_size=world_size
             )
@@ -341,13 +358,16 @@ class UnifiedTrainer:
         
         model_module = self.model.module if self.is_distributed else self.model
         
-        # LAS uses different learning rates for the prompt encoder and Point-MAE encoder.
-        if self.config['model']['name'] == 'las':
+        # LAS-family models use separate encoder and decoder learning rates.
+        model_name = str(self.config['model']['name']).lower()
+        if model_name in {'las', 'fbd_afford'}:
             # Get prompt encoder parameters (either visual or text)
             prompt_params = [p for p in model_module.prompt_encoder.parameters() if p.requires_grad]
             
-            # Group 2: Point-MAE parameters (LR * 0.2)
-            pointmae_params = list(model_module.point_encoder.parameters())
+            # Group 2: trainable Point-MAE parameters
+            pointmae_params = [
+                p for p in model_module.point_encoder.parameters() if p.requires_grad
+            ]
 
             # Group 3: Rest of the model parameters (base LR)
             prompt_param_ids = {id(p) for p in prompt_params}
@@ -355,21 +375,41 @@ class UnifiedTrainer:
             
             other_params = [
                 p for p in model_module.parameters() 
-                if id(p) not in prompt_param_ids and id(p) not in pointmae_param_ids
+                if p.requires_grad
+                and id(p) not in prompt_param_ids
+                and id(p) not in pointmae_param_ids
             ]
 
             # Determine prompt encoder type for naming
             prompt_type = self.config['model'].get('prompt_type', 'visual')
             prompt_name = f'{prompt_type}_encoder'
 
-            param_groups = [
-                {'params': prompt_params, 'lr': lr * 0.1, 'name': prompt_name},
-                {'params': pointmae_params, 'lr': lr * 0.2, 'name': 'point_encoder'},
-                {'params': other_params, 'lr': lr, 'name': 'other_modules'}
-            ]
+            if model_name == 'fbd_afford':
+                prompt_lr = float(self.config['training'].get('prompt_lr', lr * 0.1))
+                point_lr = float(self.config['training'].get('backbone_lr', lr * 0.1))
+                head_lr = float(self.config['training'].get('head_lr', lr))
+            else:
+                prompt_lr = lr * 0.1
+                point_lr = lr * 0.2
+                head_lr = lr
+
+            param_groups = []
+            for params, group_lr, name in (
+                (prompt_params, prompt_lr, prompt_name),
+                (pointmae_params, point_lr, 'point_encoder'),
+                (other_params, head_lr, 'other_modules'),
+            ):
+                if params:
+                    param_groups.append({'params': params, 'lr': group_lr, 'name': name})
+
+            if not param_groups:
+                raise ValueError("No trainable parameters were found")
 
             if self.rank == 0:
-                print(f"Optimizer configured with parameter groups for LAS ({prompt_type} prompt):")
+                print(
+                    f"Optimizer configured for {model_name} "
+                    f"({prompt_type} prompt):"
+                )
                 total_params = 0
                 for group in param_groups:
                     group_param_count = sum(p.numel() for p in group['params'])
@@ -427,6 +467,28 @@ class UnifiedTrainer:
         """Setup loss functions"""
         self.loss_function = get_loss_function(self.config)
         self.model_name = self.config['model']['name'].lower()
+
+    def _compute_batch_loss(self, outputs, batch):
+        if self.model_name == 'fbd_afford':
+            return self.loss_function(outputs, batch)
+        return self.loss_function(outputs['segmentation_logits'], batch['gt_mask'])
+
+    def _loss_components(self, loss_dict):
+        if self.model_name == 'fbd_afford':
+            return loss_dict['segmentation'], loss_dict['union']
+        return loss_dict['focal_loss'], loss_dict['dice_loss']
+
+    def _component_names(self):
+        if self.model_name == 'fbd_afford':
+            return 'Segmentation', 'Union'
+        return 'Focal', 'Dice'
+
+    def _metric_tensors(self, outputs, batch):
+        predictions = torch.sigmoid(outputs['segmentation_logits'])
+        if self.model_name == 'fbd_afford':
+            valid = batch['valid'].bool()
+            return predictions[valid], batch['masks'][valid]
+        return predictions, batch['gt_mask']
         
     def train_epoch(self):
         """Train for one epoch"""
@@ -444,6 +506,7 @@ class UnifiedTrainer:
         total_loss = 0
         seg_loss_total = 0
         cont_loss_total = 0
+        primary_name, auxiliary_name = self._component_names()
         
         # Only show progress bar on rank 0
         if self.rank == 0:
@@ -468,6 +531,17 @@ class UnifiedTrainer:
                     if 'points' in batch and mask_shape[1] != batch['points'].shape[1]:
                         print(f"Warning: Point-mask mismatch in batch {batch_idx}: {batch['points'].shape[1]} vs {mask_shape[1]}, skipping")
                         continue
+                if 'masks' in batch:
+                    mask_shape = batch['masks'].shape
+                    if len(mask_shape) != 3:
+                        print(f"Warning: Invalid masks shape {mask_shape}, skipping batch {batch_idx}")
+                        continue
+                    if 'points' in batch and mask_shape[2] != batch['points'].shape[1]:
+                        print(
+                            f"Warning: Point-mask mismatch in batch {batch_idx}: "
+                            f"{batch['points'].shape[1]} vs {mask_shape[2]}, skipping"
+                        )
+                        continue
                         
             except Exception as e:
                 print(f"Error validating batch {batch_idx}: {e}, skipping")
@@ -480,12 +554,8 @@ class UnifiedTrainer:
             # Forward pass
             outputs = self.model(batch)
             
-            loss, loss_dict = self.loss_function(
-                outputs['segmentation_logits'],
-                batch['gt_mask']
-            )
-            seg_loss = loss_dict['focal_loss']
-            cont_loss = loss_dict['dice_loss']
+            loss, loss_dict = self._compute_batch_loss(outputs, batch)
+            seg_loss, cont_loss = self._loss_components(loss_dict)
             
             # Backward pass
             self.optimizer.zero_grad()
@@ -505,15 +575,19 @@ class UnifiedTrainer:
             if self.rank == 0:
                 progress_bar.set_postfix({
                     'Loss': f'{loss.item():.4f}',
-                    'Focal': f'{seg_loss.item():.4f}',
-                    'Dice': f'{cont_loss.item():.4f}'
+                    primary_name: f'{seg_loss.item():.4f}',
+                    auxiliary_name: f'{cont_loss.item():.4f}'
                 })
                 
                 # Log to tensorboard
                 global_step = self.epoch * len(self.train_loader) + batch_idx
                 self.writer.add_scalar('Train/Loss', loss.item(), global_step)
-                self.writer.add_scalar('Train/FocalLoss', seg_loss.item(), global_step)
-                self.writer.add_scalar('Train/DiceLoss', cont_loss.item(), global_step)
+                self.writer.add_scalar(
+                    f'Train/{primary_name}', seg_loss.item(), global_step
+                )
+                self.writer.add_scalar(
+                    f'Train/{auxiliary_name}', cont_loss.item(), global_step
+                )
         
         # Epoch averages
         avg_loss = total_loss / len(self.train_loader)
@@ -548,12 +622,8 @@ class UnifiedTrainer:
                 # Forward pass
                 outputs = self.model(batch)
                 
-                loss, loss_dict = self.loss_function(
-                    outputs['segmentation_logits'],
-                    batch['gt_mask']
-                )
-                seg_loss = loss_dict['focal_loss']
-                cont_loss = loss_dict['dice_loss']
+                loss, loss_dict = self._compute_batch_loss(outputs, batch)
+                seg_loss, cont_loss = self._loss_components(loss_dict)
                 
                 # Update metrics
                 total_loss += loss.item()
@@ -561,8 +631,9 @@ class UnifiedTrainer:
                 cont_loss_total += cont_loss.item()
                 
                 # Collect predictions for metrics
-                predictions = torch.sigmoid(outputs['segmentation_logits']).cpu().numpy()
-                targets = batch['gt_mask'].cpu().numpy()
+                predictions, targets = self._metric_tensors(outputs, batch)
+                predictions = predictions.cpu().numpy()
+                targets = targets.cpu().numpy()
                 
                 all_predictions.append(predictions)
                 all_targets.append(targets)
@@ -691,9 +762,18 @@ class UnifiedTrainer:
             
             # Logging (only on rank 0)
             if self.rank == 0:
+                primary_name, auxiliary_name = self._component_names()
                 print(f"Epoch {epoch}:")
-                print(f"  Train Loss: {train_loss:.4f} (Focal: {train_seg_loss:.4f}, Dice: {train_cont_loss:.4f})")
-                print(f"  Val Loss: {val_loss:.4f} (Focal: {val_seg_loss:.4f}, Dice: {val_cont_loss:.4f})")
+                print(
+                    f"  Train Loss: {train_loss:.4f} "
+                    f"({primary_name}: {train_seg_loss:.4f}, "
+                    f"{auxiliary_name}: {train_cont_loss:.4f})"
+                )
+                print(
+                    f"  Val Loss: {val_loss:.4f} "
+                    f"({primary_name}: {val_seg_loss:.4f}, "
+                    f"{auxiliary_name}: {val_cont_loss:.4f})"
+                )
                 print(f"  Val aIoU: {val_metrics['aiou']:.4f}")
                 print(f"  Val AUC: {val_metrics['auc']:.4f}")
                 print(f"  Val SIM: {val_metrics['sim']:.4f}")
@@ -721,10 +801,18 @@ class UnifiedTrainer:
                 self.writer.add_scalar('Train/EpochLoss', train_loss, epoch)
                 self.writer.add_scalar('Val/EpochLoss', val_loss, epoch)
                 
-                self.writer.add_scalar('Train/EpochFocalLoss', train_seg_loss, epoch)
-                self.writer.add_scalar('Train/EpochDiceLoss', train_cont_loss, epoch)
-                self.writer.add_scalar('Val/EpochFocalLoss', val_seg_loss, epoch)
-                self.writer.add_scalar('Val/EpochDiceLoss', val_cont_loss, epoch)
+                self.writer.add_scalar(
+                    f'Train/Epoch{primary_name}', train_seg_loss, epoch
+                )
+                self.writer.add_scalar(
+                    f'Train/Epoch{auxiliary_name}', train_cont_loss, epoch
+                )
+                self.writer.add_scalar(
+                    f'Val/Epoch{primary_name}', val_seg_loss, epoch
+                )
+                self.writer.add_scalar(
+                    f'Val/Epoch{auxiliary_name}', val_cont_loss, epoch
+                )
                 
                 for metric_name, metric_value in val_metrics.items():
                     self.writer.add_scalar(f'Val/{metric_name}', metric_value, epoch)

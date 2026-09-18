@@ -110,6 +110,51 @@ class LASModel(nn.Module):
         nn.init.xavier_uniform_(self.point_projection.weight)
         nn.init.constant_(self.prompt_projection.bias, 0)
         nn.init.constant_(self.point_projection.bias, 0)
+
+    def encode_points(self, points):
+        """Encode a point cloud without conditioning it on a prompt."""
+        if points.ndim != 3 or points.shape[-1] != 3:
+            raise ValueError(
+                f"points must have shape [B, N, 3], got {tuple(points.shape)}"
+            )
+        if points.shape[1] == 0:
+            raise ValueError("Empty point cloud detected in batch")
+
+        point_group_features, point_group_centers = self.point_encoder(points)
+        point_features_proj = self.point_projection(point_group_features)
+        upsampled_point_features = self.feature_propagation(
+            points.transpose(1, 2).contiguous().to(dtype=torch.float32),
+            point_group_centers.transpose(1, 2).contiguous().to(dtype=torch.float32),
+            None,
+            point_features_proj.transpose(1, 2).contiguous().to(dtype=torch.float32),
+        )
+        upsampled_point_features = upsampled_point_features.transpose(1, 2).contiguous()
+        if upsampled_point_features.shape[:2] != points.shape[:2]:
+            raise ValueError(
+                "Feature propagation output does not match input points: "
+                f"{tuple(upsampled_point_features.shape[:2])} vs {tuple(points.shape[:2])}"
+            )
+        if not torch.isfinite(upsampled_point_features).all():
+            raise RuntimeError("Point encoder produced NaN or Inf values")
+        return upsampled_point_features
+
+    def encode_prompts(self, images=None, texts=None):
+        """Encode and project visual or text prompt tokens."""
+        if self.prompt_type == 'visual':
+            if images is None:
+                raise ValueError("images are required for a visual prompt encoder")
+            prompt_features = self.prompt_encoder(images)
+            attention_mask = torch.ones(
+                prompt_features.shape[:2],
+                device=prompt_features.device,
+                dtype=torch.bool,
+            )
+        else:
+            if texts is None:
+                raise ValueError("texts are required for a text prompt encoder")
+            prompt_features, attention_mask = self.prompt_encoder(texts)
+
+        return self.prompt_projection(prompt_features), attention_mask
     
     def forward(self, batch):
         """

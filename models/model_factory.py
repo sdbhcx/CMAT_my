@@ -71,6 +71,9 @@ def get_loss_function(config):
             focal_gamma=loss_config.get('focal_gamma', 2.0),
             segmentation_weight=loss_config.get('segmentation', 1.0),
             union_weight=loss_config.get('union', 0.2),
+            segmentation_loss=loss_config.get('segmentation_loss', 'fbd'),
+            focal_weight=loss_config.get('focal_weight', 1.0),
+            dice_weight=loss_config.get('dice_weight', 1.0),
         )
 
     raise ValueError(f"Unsupported model type: {model_name}")

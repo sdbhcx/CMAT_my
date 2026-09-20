@@ -73,7 +73,7 @@ class ControlledTrainer(UnifiedTrainer):
 
 def restore_training(trainer, path, restart_lr=None):
     checkpoint = torch.load(path, map_location='cpu')
-    for key in ('model', 'data', 'seed', 'dataset_type', 'setting_type'):
+    for key in ('model', 'data', 'loss', 'seed', 'dataset_type', 'setting_type'):
         if checkpoint['config'].get(key) != trainer.config.get(key):
             raise ValueError(f'Resume configuration mismatch: {key}')
     start = int(checkpoint['epoch']) + 1

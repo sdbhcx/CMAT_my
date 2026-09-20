@@ -1,0 +1,93 @@
+model:
+  name: fbd_afford
+  prompt_type: visual
+  image_encoder:
+    model_name: dinov3_vitb16
+    frozen: true
+    finetune_layers: 0
+    dino_local_repo: /home/junbo/wyn/model/dinov3
+    dino_local_weights_name: /home/junbo/wyn/model/dinov3_vitb16/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
+  point_encoder:
+    embed_dim: 384
+    depth: 12
+    num_heads: 6
+    group_size: 32
+    num_group: 128
+    mask_ratio: 0.0
+    pretrain: true
+    pretrain_path: pointmae/pretrain.pth
+    frozen: true
+  unified_sequence:
+    unified_dim: 512
+  co_attention:
+    num_heads: 8
+    num_layers: 1
+    dim_feedforward: 1024
+    dropout: 0.1
+  segmentation_head:
+    hidden_dim: 256
+    num_layers: 2
+    dropout: 0.1
+  num_basis: 8
+  basis_hidden_dim: 256
+  selector_hidden_dim: 256
+  selector_temperature: 0.2
+  selector_temperature_fixed: true
+  freeze_encoder_wrappers: true
+dataset_type: piadv2
+name: fbd_las_seg_union0_holdout_t02_30ep_cont_seed42
+data:
+  image_size:
+  - 224
+  - 224
+  num_points: 2048
+  max_affordances_per_object: 4
+  index_paths:
+    train: work/index/piadv2/Unseen_obj/train_holdout_seed42.json
+    val: work/index/piadv2/Unseen_obj/val_holdout_seed42.json
+  min_train_affordances: 2
+  use_augmentation: true
+  validation_split: val
+  object_las_compat: false
+loss:
+  stage: A
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  focal_weight: 1.0
+  dice_weight: 1.0
+  segmentation: 1.0
+  union: 0.0
+  relation: 0.0
+  coefficient_relation: 0.0
+  basis_diversity: 0.0
+  coefficient_sparsity: 0.0
+  cross_object_correspondence: 0.0
+  segmentation_loss: las
+training:
+  epochs: 30
+  batch_size: 2
+  batch_size_objects: 2
+  learning_rate: 0.0001
+  head_lr: 0.0001
+  backbone_lr: 1.0e-05
+  prompt_lr: 1.0e-05
+  weight_decay: 0.05
+  optimizer: adamw
+  scheduler: cosine
+  num_workers: 4
+paths:
+  data_root: /home/datasets/PIAD2
+  checkpoint_dir: work/stage_a/controlled/checkpoints
+  log_dir: work/stage_a/controlled/logs
+hardware:
+  use_cuda: true
+  pin_memory: true
+  mixed_precision: false
+setting_type: Unseen_obj
+seed: 42
+previous_status: work/stage_a/controlled/union0_20260920_212334/10ep_status.json
+continuation_schedule:
+  completed_epochs: 10
+  additional_epochs: 20
+  restart_lr: 5.0e-05
+  eta_min: 1.0e-06

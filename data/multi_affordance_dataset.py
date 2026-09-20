@@ -1,8 +1,7 @@
 """Object-shaped batching for functional-basis training.
 
-The MVP wraps each existing PIAD/PIADv2 sample as an affordance set of size one.
-This preserves the current pairing semantics and provides the final ``[B, A, ...]``
-contract without inventing unverified cross-affordance object associations.
+Audited indexes provide true instance sets. Without an index, each legacy sample
+remains an A=1 set, preserving existing pairing semantics.
 """
 
 from __future__ import annotations
@@ -112,7 +111,60 @@ def get_fbd_dataloader(
     rank: int = 0,
     world_size: int = 1,
 ):
-    """Build an FBD dataloader from an existing PIAD or PIADv2 dataset."""
+    """Use an audited object index when configured, otherwise preserve A=1."""
+    data_config = config.get('data', {})
+    index_paths = data_config.get('index_paths', {})
+    index_path = index_paths.get(split)
+    if index_paths and not index_path:
+        raise ValueError(f'Missing data.index_paths.{split}; refusing legacy fallback')
+    if data_config.get('index_path') and not index_paths:
+        raise ValueError('Use data.index_paths.train/test to avoid training/evaluation index reuse')
+    if index_path:
+        from data.indexed_affordance_dataset import ObjectAffordanceDataset
+        from data.multi_affordance_collate import las_object_collate
+
+        dataset = ObjectAffordanceDataset(
+            index_path, config['paths']['data_root'],
+            num_points=int(data_config.get('num_points', 2048)),
+            max_affordances=int(data_config.get('max_affordances_per_object', 4)),
+            image_size=data_config.get('image_size', (224, 224)),
+            training=(split == 'train'), augment=data_config.get('use_augmentation', True),
+            seed=int(config.get('seed', 42)), rank=rank,
+            min_affordances=int(data_config.get('min_train_affordances', 1)) if split == 'train' else 1,
+        )
+        if len(dataset) == 0:
+            raise ValueError('No objects satisfy the configured affordance count')
+        if dataset.index['split'] != split:
+            raise ValueError(f'Index split does not match requested {split}')
+        if dataset.index['dataset'] != config.get('dataset_type', 'piadv2'):
+            raise ValueError('Index dataset does not match dataset_type')
+        from data.object_affordance_index import load_index
+        current_ids = {obj['object_id'] for obj in dataset.index['objects']}
+        for other_split, other_path in index_paths.items():
+            if other_split == split:
+                continue
+            other = load_index(other_path)
+            if any(other[key] != dataset.index[key] for key in ('affordance_vocabulary', 'category_vocabulary')):
+                raise ValueError('Index vocabularies must match across splits')
+            if current_ids & {obj['object_id'] for obj in other['objects']}:
+                raise ValueError('Object ID leakage between configured indexes')
+        relation_enabled = any(float(config.get('loss', {}).get(name, 0)) != 0
+                               for name in ('relation', 'coefficient_relation'))
+        if relation_enabled and not dataset.index['audit'].get('relation_ready', False):
+            raise ValueError('Relation losses require a GO audit')
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
+                                     shuffle=(split == 'train'), seed=int(config.get('seed', 42))) if world_size > 1 else None
+        training_config = config['training']
+        loader = DataLoader(
+            dataset, batch_size=training_config.get('batch_size_objects', training_config.get('batch_size', 4)),
+            shuffle=(split == 'train' and sampler is None), sampler=sampler,
+            num_workers=training_config.get('num_workers', config.get('num_workers', 4)),
+            pin_memory=config.get('hardware', {}).get('pin_memory', True),
+            drop_last=(split == 'train'),
+            generator=torch.Generator().manual_seed(int(config.get('seed', 42)) + rank),
+            collate_fn=las_object_collate if data_config.get('object_las_compat', False) else multi_affordance_collate,
+        )
+        return loader, sampler
     max_affordances = int(config.get("data", {}).get("max_affordances_per_object", 1))
     if max_affordances != 1:
         raise ValueError(

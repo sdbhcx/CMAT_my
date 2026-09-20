@@ -305,7 +305,10 @@ class UnifiedTrainer:
         self.dataset_type = dataset_type
 
         is_fbd = str(config['model']['name']).lower() == 'fbd_afford'
-        if is_fbd:
+        object_compat = bool(config.get('data', {}).get('object_las_compat', False))
+        if object_compat and (str(config['model']['name']).lower() != 'las' or config['model'].get('prompt_type', 'visual') != 'visual' or not config.get('data', {}).get('index_paths')):
+            raise ValueError('object_las_compat requires visual LAS and explicit train/test object indexes')
+        if is_fbd or object_compat:
             self.train_loader, self.train_sampler = get_fbd_dataloader(
                 config,
                 split='train',
@@ -314,7 +317,7 @@ class UnifiedTrainer:
             )
             self.val_loader, self.val_sampler = get_fbd_dataloader(
                 config,
-                split='test',
+                split=config.get('data', {}).get('validation_split', 'test'),
                 rank=rank,
                 world_size=world_size,
             )
@@ -536,6 +539,9 @@ class UnifiedTrainer:
         """Train for one epoch"""
         self.model.train()
         
+        if hasattr(self.train_loader.dataset, 'set_epoch'):
+            self.train_loader.dataset.set_epoch(self.epoch)
+
         # Set epoch for distributed sampler
         if self.is_distributed and self.train_sampler is not None:
             self.train_sampler.set_epoch(self.epoch)
@@ -810,7 +816,7 @@ class UnifiedTrainer:
 
         logging.info("Starting training...")
         
-        for epoch in range(self.config['training']['epochs']):
+        for epoch in range(self.epoch, self.config['training']['epochs']):
             self.epoch = epoch
             
             # Training
@@ -938,7 +944,7 @@ def train_worker(rank, world_size, config, resume_path=None):
             trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if trainer.scheduler and checkpoint['scheduler_state_dict']:
                 trainer.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            trainer.epoch = checkpoint['epoch']
+            trainer.epoch = checkpoint['epoch'] + 1
             trainer.best_val_aiou = checkpoint.get('best_val_aiou', checkpoint.get('best_val_iou', 0.0))
             trainer.best_val_loss = checkpoint['best_val_loss']
             
@@ -1021,7 +1027,7 @@ def main():
             trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if trainer.scheduler and checkpoint['scheduler_state_dict']:
                 trainer.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            trainer.epoch = checkpoint['epoch']
+            trainer.epoch = checkpoint['epoch'] + 1
             trainer.best_val_aiou = checkpoint.get('best_val_aiou', checkpoint.get('best_val_iou', 0.0))
             trainer.best_val_loss = checkpoint['best_val_loss']
             print(f"Resumed from epoch {trainer.epoch}")

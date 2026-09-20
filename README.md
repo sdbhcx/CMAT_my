@@ -366,8 +366,13 @@ python train.py --config configs/piadv2_fbd.yaml
 The MVP safely adapts each existing PIAD/PIADv2 sample to an object-shaped batch
 with one affordance (`A=1`) and trains segmentation plus functional-union
 coverage. It does not fabricate object-level cross-affordance pairs. Relation
-losses and true `A>1` training must remain disabled until an audited object index
-is available.
+losses remain disabled until an audited object index is available. True `A>1`
+loading is now supported through explicit `data.index_paths.train/test` mappings.
+See [Stage 0/1 data audit and object-index workflow](docs/Multi_Affordance_Data.md)
+for raw PIAD/PIADv2 audits, manifest schema, alignment, index generation, and LAS compatibility.
+
+For the verified PIADv2 Unseen_obj category/affordance cue protocol, real A>1 loader, and Stage A training validation, see [PIADv2 Stage A](docs/PIADv2_Stage_A.md).
+
 
 Training outputs:
 

@@ -72,6 +72,11 @@ class LASModel(nn.Module):
         else:
             raise ValueError(f"Unsupported prompt_type: {self.prompt_type}. Must be 'visual' or 'text'.")
         
+        if config['model'].get('freeze_encoder_wrappers', False):
+            self.point_encoder.requires_grad_(False)
+            if self.prompt_encoder is not None:
+                self.prompt_encoder.requires_grad_(False)
+
         # Unified sequence parameters
         self.unified_dim = config['model']['unified_sequence']['unified_dim']
         
@@ -110,6 +115,14 @@ class LASModel(nn.Module):
         # Initialize weights
         self.init_weights()
     
+    def train(self, mode=True):
+        super().train(mode)
+        if self.model_config.get('freeze_encoder_wrappers', False):
+            self.point_encoder.eval()
+            if self.prompt_encoder is not None:
+                self.prompt_encoder.eval()
+        return self
+
     def init_weights(self):
         """Initialize model weights"""
         # Initialize type embeddings

@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "dataset": "piadv2",
+  "affordance_vocabulary": ["grasp", "lift"],
+  "records": [
+    {
+      "object_id": "original-mesh-001",
+      "category": "Mug",
+      "setting": "Seen",
+      "split": "train",
+      "identity_verified": false,
+      "identity_evidence": "Replace with the source annotation or verified mapping rule; do not use category equality as evidence",
+      "point_source": {"path": "Seen/Point/train/Mug/source/grasp/object-001.npy", "format": "piadv2_npy"},
+      "mask_columns": {"grasp": 0},
+      "images": {"grasp": ["Seen/Img/train/Mug/source/grasp/image-001.jpg"]}
+    },
+    {
+      "object_id": "original-mesh-001",
+      "category": "Mug",
+      "setting": "Seen",
+      "split": "train",
+      "identity_verified": false,
+      "identity_evidence": "Replace with verified provenance before setting identity_verified to true",
+      "point_source": {"path": "Seen/Point/train/Mug/source/lift/object-001.npy", "format": "piadv2_npy"},
+      "mask_columns": {"lift": 0},
+      "images": {"lift": ["Seen/Img/train/Mug/source/lift/image-002.jpg"]}
+    }
+  ]
+}

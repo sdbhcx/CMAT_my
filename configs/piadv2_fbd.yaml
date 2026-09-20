@@ -3,13 +3,17 @@
 # segmentation + functional-union coverage without relation losses.
 
 model:
-  name: fbd_afford
+  name: las
   prompt_type: visual
 
   image_encoder:
-    model_name: dinov2_vitb14
-    frozen: true
-    finetune_layers: 0
+    # model_name: 'facebook/dinov2-vitb14'  # or use DINOv3
+    model_name: 'dinov3_vitb16'
+    frozen: false
+    finetune_layers: 2  # Number of layers to fine-tune from the end
+    # For DINOv3, uncomment these:
+    dino_local_repo: '/home/junbo/wyn/model/dinov3'
+    dino_local_weights_name: '/home/junbo/wyn/model/dinov3_vitb16/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth'
 
   point_encoder:
     embed_dim: 384
@@ -43,6 +47,7 @@ model:
   selector_temperature: 0.07
 
 dataset_type: piadv2
+name: fbd_afford
 
 data:
   image_size: [224, 224]
@@ -53,6 +58,8 @@ loss:
   stage: A
   focal_alpha: 0.25
   focal_gamma: 2.0
+  focal_weight: 0.5
+  dice_weight: 1.0
   segmentation: 1.0
   union: 0.2
   relation: 0.0
@@ -75,10 +82,9 @@ training:
   num_workers: 4
 
 paths:
-  data_root: Data/PIADv2/Seen
-  checkpoint_dir: checkpoints
-  log_dir: logs
-
+  data_root: '/home/datasets/PIAD2/Unseen_aff'  # PIAD dataset path
+  checkpoint_dir: 'checkpoints'
+  log_dir: 'logs'
 hardware:
   use_cuda: true
   pin_memory: true

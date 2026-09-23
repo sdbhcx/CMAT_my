@@ -1,0 +1,449 @@
+{
+  "version": "v2-fte",
+  "language": "en",
+  "generator": "scripts/build_description_bank_v2.py",
+  "reference": "Aff3DFunc (MM'25) functional text enhancement, four semantic views",
+  "views": [
+    "action",
+    "function",
+    "appearance",
+    "environment"
+  ],
+  "description_count": 8,
+  "per_view_count": 2,
+  "notes": "四个视角各 2 条；appearance 沿用 v1 池前 2 条，action/function/environment 按 affordance 语义新写。描述只讲区域的功能语义，不含实例掩码或测试答案。",
+  "entries": {
+    "beat": {
+      "action": [
+        "a region you can swing or strike against something",
+        "a place where impact is delivered to a target"
+      ],
+      "function": [
+        "a head that delivers force on impact",
+        "a striking face that transfers momentum to the target"
+      ],
+      "appearance": [
+        "A face that can be struck to produce sound",
+        "A head or surface that can be hit with a hand or stick"
+      ],
+      "environment": [
+        "usable when repeated striking is needed",
+        "effective when there is room to swing"
+      ]
+    },
+    "carry": {
+      "action": [
+        "a region you can hold while transporting the object",
+        "a place where the hand keeps the object steady in motion"
+      ],
+      "function": [
+        "a zone that bears the load while the object is moved",
+        "a place that keeps the object balanced during transport"
+      ],
+      "appearance": [
+        "A handle that a hand can hold while moving the object",
+        "A strap or band that can be held or slung"
+      ],
+      "environment": [
+        "usable when the object must be taken elsewhere",
+        "effective when walking with the object in hand"
+      ]
+    },
+    "clean": {
+      "action": [
+        "a region you can rub against a surface to remove dirt",
+        "a place where the object is swept across a soiled area"
+      ],
+      "function": [
+        "a working face that lifts or loosens dirt on contact",
+        "an area that does the scrubbing or wiping work"
+      ],
+      "appearance": [
+        "A surface that can be wiped with a cloth or hand",
+        "A contact face that touches the surface being cleaned"
+      ],
+      "environment": [
+        "usable when a surface needs dirt removed",
+        "effective when combined with water or cleaner"
+      ]
+    },
+    "contain": {
+      "action": [
+        "a region you can place loose items into without them falling out",
+        "a space where contents can be dropped and left to settle"
+      ],
+      "function": [
+        "a space that keeps loose items gathered in one place",
+        "a volume that prevents contents from scattering"
+      ],
+      "appearance": [
+        "An inner cavity that can hold loose items without spilling",
+        "An upward-opening bowl or basin shaped surface"
+      ],
+      "environment": [
+        "usable when the object sits upright on a stable surface",
+        "effective when items need to be held during transport"
+      ]
+    },
+    "cut": {
+      "action": [
+        "a region you can draw across material to separate it",
+        "a place where the edge is dragged through the workpiece"
+      ],
+      "function": [
+        "an edge that concentrates force to sever material",
+        "a boundary that splits material along a line"
+      ],
+      "appearance": [
+        "A thin sharp edge that can slice through material",
+        "A blade edge that meets the material along a line"
+      ],
+      "environment": [
+        "usable when material needs separating into pieces",
+        "effective when the object is held steady against the material"
+      ]
+    },
+    "display": {
+      "action": [
+        "a region where an item can be placed to be seen",
+        "a place you can arrange objects on for viewing"
+      ],
+      "function": [
+        "a surface that presents items at a visible angle",
+        "a zone that makes placed objects easy to look at"
+      ],
+      "appearance": [
+        "A front-facing surface that faces a viewer",
+        "A screen or panel area that shows visual content"
+      ],
+      "environment": [
+        "usable in a room where people pass by and look",
+        "suitable when objects should stay visible rather than stored"
+      ]
+    },
+    "grasp": {
+      "action": [
+        "a region you can wrap your fingers around and squeeze to hold firmly",
+        "a place where the hand can close and apply opposing pressure"
+      ],
+      "function": [
+        "a place that lets the hand take control of the whole object",
+        "a contact zone that keeps the object from slipping out of the hand"
+      ],
+      "appearance": [
+        "A narrow part that a hand can close around with fingers and thumb",
+        "A protruding handle or bar that leaves clearance for a grip"
+      ],
+      "environment": [
+        "usable when the object is within arm's reach and unobstructed",
+        "reliable to grab when the object rests on a flat surface"
+      ]
+    },
+    "lay": {
+      "action": [
+        "a region a person can rest their body across horizontally",
+        "a place where the body can be lowered down onto"
+      ],
+      "function": [
+        "a surface that spreads body weight evenly to avoid pressure",
+        "a plane that keeps a lying person supported and level"
+      ],
+      "appearance": [
+        "A broad flat surface where an object can be placed down",
+        "A horizontal top plane that stays stable under a load"
+      ],
+      "environment": [
+        "usable when the person needs to rest for an extended time",
+        "suitable in a quiet indoor space meant for resting"
+      ]
+    },
+    "lift": {
+      "action": [
+        "a region you can push upward on to raise the object",
+        "a place where an upward force can be applied without slipping"
+      ],
+      "function": [
+        "a place that carries the weight of the whole object when raised",
+        "a load-bearing zone that transfers lifting force into the object"
+      ],
+      "appearance": [
+        "A handle or grip that supports pulling the object upward",
+        "A stable underside where a hand can support the weight from below"
+      ],
+      "environment": [
+        "usable when the object is heavy enough to need a firm hold",
+        "safe to lift from when there is clear space above"
+      ]
+    },
+    "listen": {
+      "action": [
+        "a region you can bring close to the ear to hear sound",
+        "a place where sound is emitted and can be received"
+      ],
+      "function": [
+        "a zone that outputs audible sound toward a listener",
+        "an area that couples sound from the device to the ear"
+      ],
+      "appearance": [
+        "An ear-facing part that sits close to the listener ear",
+        "A speaker opening where sound comes out"
+      ],
+      "environment": [
+        "usable in a quiet setting where the sound is audible",
+        "effective when the listener is close to the object"
+      ]
+    },
+    "move": {
+      "action": [
+        "a region you can push or pull to shift the object's position",
+        "a place where force can start or guide motion"
+      ],
+      "function": [
+        "a zone that lets the object be repositioned without damage",
+        "a contact place that transfers pushing force into movement"
+      ],
+      "appearance": [
+        "A handle that lets the object be pushed or dragged across a surface",
+        "A base or wheel region that slides along the ground"
+      ],
+      "environment": [
+        "usable when the object needs relocating across a surface",
+        "effective when there is clear space in the direction of travel"
+      ]
+    },
+    "open": {
+      "action": [
+        "a region you can pull or press to make an enclosure accessible",
+        "a place where force starts the movement of a lid or door"
+      ],
+      "function": [
+        "a place that releases the closure and exposes the interior",
+        "a trigger zone that separates two joined parts"
+      ],
+      "appearance": [
+        "A handle that can be pulled to swing a door or lid outward",
+        "An edge or lip where fingers can pry a cover apart"
+      ],
+      "environment": [
+        "usable when the container is closed and needs accessing",
+        "effective when one hand can steady the body while opening"
+      ]
+    },
+    "play": {
+      "action": [
+        "a region you can strike, press or handle to use the object",
+        "a place where the user interacts during play"
+      ],
+      "function": [
+        "a zone that responds to interaction with sound or motion",
+        "an area that produces the intended play response"
+      ],
+      "appearance": [
+        "A part that is struck or manipulated during play",
+        "A surface that is touched or pressed to produce sound"
+      ],
+      "environment": [
+        "usable when the object is being used for recreation",
+        "effective in a setting meant for leisure activity"
+      ]
+    },
+    "pour": {
+      "action": [
+        "a region you can tilt so liquid or contents flow out",
+        "a place where the opening directs the stream outward"
+      ],
+      "function": [
+        "a spout that controls the direction and rate of flow",
+        "a mouth that lets contents leave the container cleanly"
+      ],
+      "appearance": [
+        "A spout or lip that directs liquid out in a controlled stream",
+        "An open mouth or rim from which contents can be tipped out"
+      ],
+      "environment": [
+        "usable when the container is tipped over a target",
+        "effective when the contents are liquid or granular"
+      ]
+    },
+    "press": {
+      "action": [
+        "a region you can push down on with a finger",
+        "a place where a short press triggers a response"
+      ],
+      "function": [
+        "a zone that receives finger force and activates a control",
+        "an area that registers a deliberate press"
+      ],
+      "appearance": [
+        "A flat area that a finger can push down on",
+        "A raised button that depresses under finger force"
+      ],
+      "environment": [
+        "usable when the object is within fingertip reach",
+        "effective when a deliberate input is needed"
+      ]
+    },
+    "pull": {
+      "action": [
+        "a region you can grip and draw toward yourself",
+        "a place where a pulling force is applied to open or move"
+      ],
+      "function": [
+        "a handle that lets a pulling force move the whole object",
+        "a zone that transfers a tug into motion of the part"
+      ],
+      "appearance": [
+        "A handle that can be grasped and drawn toward the body",
+        "An edge or lip where fingers can hook and pull"
+      ],
+      "environment": [
+        "usable when the object or part must come toward the user",
+        "effective when there is clearance in the pulling direction"
+      ]
+    },
+    "push": {
+      "action": [
+        "a region you can press against with the hand or body",
+        "a place where forward force is applied to slide something"
+      ],
+      "function": [
+        "a zone that takes compressive force and moves the object away",
+        "a contact area that transfers a shove into motion"
+      ],
+      "appearance": [
+        "A flat surface where a hand can press to move the object away",
+        "A protruding part that can be pushed with a finger"
+      ],
+      "environment": [
+        "usable when the object needs to slide rather than be lifted",
+        "effective when there is open space ahead of the object"
+      ]
+    },
+    "ride": {
+      "action": [
+        "a region a person can mount and stay on",
+        "a place where the body sits or stands during travel"
+      ],
+      "function": [
+        "a surface that supports a person while the object moves",
+        "a zone that keeps the rider stable in motion"
+      ],
+      "appearance": [
+        "A surface a person can sit on while being carried",
+        "A foot support where a rider places their feet"
+      ],
+      "environment": [
+        "usable when the object is used for transport",
+        "effective on open ground with room to move"
+      ]
+    },
+    "sit": {
+      "action": [
+        "a region a person can lower themselves onto and rest",
+        "a place where the body settles with weight on the pelvis"
+      ],
+      "function": [
+        "a surface that bears body weight from above while seated",
+        "a support plane that keeps a seated person stable"
+      ],
+      "appearance": [
+        "A flat horizontal surface at seating height that supports a person",
+        "A broad stable platform that can bear body weight from above"
+      ],
+      "environment": [
+        "usable when the surface is at seating height and level",
+        "suitable wherever a person needs to stay seated for a while"
+      ]
+    },
+    "speak": {
+      "action": [
+        "a region you can bring close to the mouth to project voice",
+        "a place where sound from the mouth enters the device"
+      ],
+      "function": [
+        "a mouthpiece that channels voice into the object",
+        "an area that picks up speech for transmission or amplification"
+      ],
+      "appearance": [
+        "An opening that faces the speaker mouth",
+        "A mouthpiece region that picks up the voice"
+      ],
+      "environment": [
+        "usable when the speaker is near the object",
+        "effective when the voice needs carrying further"
+      ]
+    },
+    "stab": {
+      "action": [
+        "a region you can drive point-first into a surface",
+        "a place where the tip penetrates material"
+      ],
+      "function": [
+        "a tip that concentrates force into a small entry point",
+        "a point that pierces rather than slices"
+      ],
+      "appearance": [
+        "A sharp point that can penetrate a surface",
+        "A tapered tip that concentrates force into a small area"
+      ],
+      "environment": [
+        "usable when a small puncture is needed",
+        "effective when force is applied along the shaft"
+      ]
+    },
+    "support": {
+      "action": [
+        "a region you can set an object down onto",
+        "a place where weight can be placed from above"
+      ],
+      "function": [
+        "a surface that holds another object steady under gravity",
+        "a bearing plane that keeps placed items from tipping"
+      ],
+      "appearance": [
+        "A load-bearing surface that holds another object from below",
+        "A rigid base region that keeps an item steady"
+      ],
+      "environment": [
+        "usable when the object placed on it needs to stay put",
+        "effective on a level surface clear of clutter"
+      ]
+    },
+    "wear": {
+      "action": [
+        "a region that goes against the body when worn",
+        "a place that rests on the head, face or hands during use"
+      ],
+      "function": [
+        "a contact zone that keeps the object attached to the body",
+        "an area that fits the body so the object stays in place"
+      ],
+      "appearance": [
+        "A part that makes contact with the body when worn",
+        "An opening or band that fits around a head, wrist or torso"
+      ],
+      "environment": [
+        "usable when the object is carried on the person",
+        "suitable for extended contact with skin or clothing"
+      ]
+    },
+    "wrapgrasp": {
+      "action": [
+        "a region you can curl the whole hand around and clamp",
+        "a place where all fingers can close over at once"
+      ],
+      "function": [
+        "a place that gives a power grip for holding heavy things",
+        "a zone that lets the hand lock the object against the palm"
+      ],
+      "appearance": [
+        "A cylindrical body that a whole hand can wrap around",
+        "A rounded neck narrow enough for fingers to encircle"
+      ],
+      "environment": [
+        "usable when a firm grip is needed rather than a delicate one",
+        "reliable when the object must not rotate in the hand"
+      ]
+    }
+  }
+}

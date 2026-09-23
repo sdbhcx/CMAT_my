@@ -52,6 +52,31 @@ def cleanup_distributed():
     """Clean up distributed training"""
     dist.destroy_process_group()
 
+def load_model_state_flexible(model, state_dict, strict=True, verbose=True):
+    """加载模型权重。
+
+    V1-A 新增了 description_selector 等模块，旧 checkpoint 里没有这些键。
+    strict=False 时允许缺失键（新模块保持随机初始化），但会把缺失/多余键
+    完整打印出来，避免"静默部分加载"这种不可审计的情况。
+
+    Returns:
+        missing_keys: 模型有、checkpoint 没有的键（新模块）
+        unexpected_keys: checkpoint 有、模型没有的键（已废弃模块）
+    """
+    incompatible = model.load_state_dict(state_dict, strict=strict)
+    missing = list(getattr(incompatible, 'missing_keys', []))
+    unexpected = list(getattr(incompatible, 'unexpected_keys', []))
+    if verbose and (missing or unexpected):
+        print("[warm-start] 非严格加载：")
+        if missing:
+            print(f"  - 缺失键 {len(missing)} 个（随机初始化）: {missing[:8]}"
+                  f"{' ...' if len(missing) > 8 else ''}")
+        if unexpected:
+            print(f"  - 多余键 {len(unexpected)} 个（已忽略）: {unexpected[:8]}"
+                  f"{' ...' if len(unexpected) > 8 else ''}")
+    return missing, unexpected
+
+
 def get_distributed_dataloader(config, split='train', rank=0, world_size=1):
     """Create distributed dataloader"""
     # Normalize dataset aliases.
@@ -65,6 +90,10 @@ def get_distributed_dataloader(config, split='train', rank=0, world_size=1):
     else:
         dataset_type = 'piadv2'
     
+    # 默认 None：非 piadv2 分支不会用到，避免出现未定义变量。
+    description_bank = None
+    piadv2_collate_fn = None
+
     if dataset_type == 'laso':
         from data.laso_dataset import LASODataset, collate_fn
         
@@ -131,10 +160,13 @@ def get_distributed_dataloader(config, split='train', rank=0, world_size=1):
         )
     else:
         # PIADv2 visual-prompt dataset.
-        from data.piadv2_dataset import PIADV2Dataset
+        from data.piadv2_dataset import PIADV2Dataset, load_description_bank_from_config, piadv2_collate_fn
         
         # 统一路径处理：优先使用小写文件名，兼容大写文件名
         data_root = config['paths']['data_root']
+
+        # --- V1-A 固定描述池（未配置时为 None） ---
+        description_bank = load_description_bank_from_config(config)
         
         if split == 'train':
             # 优先尝试小写文件名（PIADv2格式）
@@ -160,12 +192,21 @@ def get_distributed_dataloader(config, split='train', rank=0, world_size=1):
         # Create dataset
         dataset = PIADV2Dataset(
             run_type=split,
-            setting_type='Seen',
+            # 设定标签从 config 读取（Seen / Unseen_obj / Unseen_aff），
+            # 不再硬编码，避免跨设定实验被静默标成 Seen。
+            setting_type=config.get('setting_type', 'Seen'),
             point_path=point_path,
             img_path=img_path,
             image_size=config['data']['image_size'],
             num_points=config['data']['num_points'],
-            use_augmentation=use_augmentation
+            use_augmentation=use_augmentation,
+            text_source=config.get('data', {}).get('text_source', 'affordance_word'),
+            description_bank=description_bank,
+            description_count=config.get('data', {}).get('description_count', 4),
+            on_bad_sample=config.get('data', {}).get('on_bad_sample', 'zeros'),
+            # 问句查询（Question-as-Query）
+            question_bank_path=config.get('data', {}).get('question_bank_path', None),
+            question_missing=config.get('data', {}).get('question_missing', 'error')
         )
     
     # Create distributed sampler
@@ -183,10 +224,46 @@ def get_distributed_dataloader(config, split='train', rank=0, world_size=1):
         sampler=sampler,
         num_workers=4,
         pin_memory=True,
-        drop_last=(split == 'train')
+        drop_last=(split == 'train'),
+        collate_fn=piadv2_collate_fn if description_bank is not None else None
     )
     
     return dataloader, sampler
+
+
+def _desc_attention_stats(alpha, eps=1e-8):
+    """统计描述选择注意力 alpha [B,R,M] 的熵特征。
+
+    归一化熵 = H(alpha) / log(有效描述条数)：
+        ~1 表示接近均匀（没在做选择，等价于 mean）
+        ~0 表示塌缩到单条描述（选择过于尖锐）
+    只统计有效描述数 >= 2 的行；全无效或含 NaN 时返回 None。
+
+    Returns:
+        (归一化熵, max_alpha, 原始熵) 或 None
+    """
+    if alpha is None:
+        return None
+    a = alpha.detach().float()
+    if a.dim() != 3 or a.numel() == 0:
+        return None
+    if not torch.isfinite(a).all():
+        return None
+
+    n_valid = (a > 1e-6).sum(dim=-1)                            # [B,R]
+    sel = n_valid >= 2                                          # 至少 2 条才有"选择"可言
+    if not bool(sel.any()):
+        return None
+
+    entropy = -(a * torch.log(a.clamp_min(eps))).sum(dim=-1)    # [B,R]
+    ref = torch.log(n_valid[sel].to(a.dtype))                   # log(M_valid)
+
+    ent_sel = entropy[sel]
+    norm_ent = (ent_sel / ref.clamp_min(eps)).mean().item()
+    max_alpha = a.max(dim=-1).values[sel].mean().item()
+    raw_ent = ent_sel.mean().item()
+    return norm_ent, max_alpha, raw_ent
+
 
 class UnifiedTrainer:
     """
@@ -346,10 +423,58 @@ class UnifiedTrainer:
         self.best_val_loss = float('inf')
         self.best_val_aiou = 0.0
         
+        # V1-A 诊断信息：把"文本分支是否真的生效"在训练一开始就显式打出来，
+        # 避免跑完几十个 epoch 才发现描述池没接上。
+        if rank == 0:
+            self._print_v1a_diagnostics()
+
         if rank == 0:
             print(f"Model created with {sum(p.numel() for p in self.model.parameters())} parameters")
             print(f"Training dataset size: {len(self.train_loader.dataset)}")
             print(f"Validation dataset size: {len(self.val_loader.dataset)}")
+
+    def _print_v1a_diagnostics(self):
+        """打印文本分支 / 固定描述池 / 区域条件选择的实际生效状态。"""
+        model_module = self.model.module if self.is_distributed else self.model
+        data_cfg = self.config.get('data', {}) or {}
+        desc_cfg = self.config.get('model', {}).get('description_selector', {}) or {}
+
+        print("=" * 62)
+        print("[V1-A 诊断] 文本分支 / 固定描述池 / 区域条件选择")
+        print(f"  prompt_type            : {self.config.get('model', {}).get('prompt_type', 'N/A')}")
+        print(f"  text_source            : {data_cfg.get('text_source', 'affordance_word')}")
+        print(f"  description_bank_path  : {data_cfg.get('description_bank_path', None)}")
+        print(f"  description_count (M)  : {data_cfg.get('description_count', 4)}")
+        print(f"  description_selector   : mode={desc_cfg.get('mode', 'off')}, "
+              f"hidden={desc_cfg.get('hidden_dim', 'N/A')}, "
+              f"temp={desc_cfg.get('temperature', 'N/A')}")
+
+        sel = getattr(model_module, 'description_selector', None)
+        print(f"  模型内选择器已构建      : {sel is not None}")
+        if sel is not None:
+            n_trainable = sum(p.numel() for p in sel.parameters() if p.requires_grad)
+            print(f"  选择器可训练参数        : {n_trainable:,}")
+            print(f"  共享文本编码器          : "
+                  f"{getattr(model_module, 'desc_text_encoder', None) is getattr(model_module, 'prompt_encoder', None)}")
+
+        # 实际取一个 batch 验证描述字段是否真的被送进模型
+        try:
+            batch = next(iter(self.train_loader))
+        except Exception as e:  # 取不到 batch 不影响启动，只记录
+            print(f"  [WARNING] 无法取样例 batch 做端到端校验: {e}")
+            print("=" * 62)
+            return
+        has_desc = 'descriptions' in batch
+        print(f"  batch 含 'descriptions' : {has_desc}")
+        if has_desc:
+            rows = batch['descriptions']
+            valid = batch.get('description_valid', None)
+            print(f"  descriptions 形状       : B={len(rows)}, M={len(rows[0]) if rows else 0}")
+            print(f"  description_valid 形状  : {tuple(valid.shape) if valid is not None else None}")
+            print(f"  样例描述[0][0]          : {rows[0][0][:70]}")
+            if valid is not None:
+                print(f"  有效描述数/样本(均值)   : {valid.float().sum(1).mean().item():.2f}")
+        print("=" * 62)
     
     def setup_logging(self):
         """Setup logging and tensorboard"""
@@ -387,6 +512,17 @@ class UnifiedTrainer:
                 prompt_params = [p for p in model_module.prompt_encoder.parameters() if p.requires_grad]
             else:
                 prompt_params = []
+            prompt_params = list(prompt_params)
+
+            # V1-A: 描述残差支路参数（选择器本体 + 可能的独立描述编码器）
+            desc_selector_params = []
+            desc_sel = getattr(model_module, 'description_selector', None)
+            if desc_sel is not None:
+                desc_selector_params = [p for p in desc_sel.parameters() if p.requires_grad]
+                desc_enc = getattr(model_module, 'desc_text_encoder', None)
+                # 与主 prompt 编码器不同对象时，视作文本编码器分支，沿用 prompt 的 LR
+                if desc_enc is not None and desc_enc is not getattr(model_module, 'prompt_encoder', None):
+                    prompt_params += [p for p in desc_enc.parameters() if p.requires_grad]
             
             # Group 2: Point-MAE parameters (LR * 0.2)
             pointmae_params = list(model_module.point_encoder.parameters())
@@ -394,19 +530,27 @@ class UnifiedTrainer:
             # Group 3: Rest of the model parameters (base LR)
             prompt_param_ids = {id(p) for p in prompt_params}
             pointmae_param_ids = {id(p) for p in pointmae_params}
+            desc_param_ids = {id(p) for p in desc_selector_params}
             
             other_params = [
                 p for p in model_module.parameters() 
-                if id(p) not in prompt_param_ids and id(p) not in pointmae_param_ids
+                if id(p) not in prompt_param_ids
+                and id(p) not in pointmae_param_ids
+                and id(p) not in desc_param_ids
             ]
 
             # Determine prompt encoder type for naming
             prompt_type = self.config['model'].get('prompt_type', 'visual')
             prompt_name = f'{prompt_type}_encoder'
 
+            desc_lr_scale = float(
+                (self.config['model'].get('description_selector', {}) or {}).get('lr_scale', 1.0))
+
             param_groups = [
                 {'params': prompt_params, 'lr': lr * 0.1, 'name': prompt_name},
                 {'params': pointmae_params, 'lr': lr * 0.2, 'name': 'point_encoder'},
+                {'params': desc_selector_params, 'lr': lr * desc_lr_scale,
+                 'name': 'description_selector'},
                 {'params': other_params, 'lr': lr, 'name': 'other_modules'}
             ]
             # drop empty groups (e.g. no prompt encoder in point-only mode)
@@ -488,7 +632,19 @@ class UnifiedTrainer:
         total_loss = 0
         seg_loss_total = 0
         cont_loss_total = 0
-        
+
+        # ---- V1-A: 描述选择熵累加器 ----
+        desc_stats_every = int(self.config.get('training', {}).get(
+            'desc_attention_log_frequency',
+            self.config.get('training', {}).get('print_frequency', 100)))
+        desc_norm_ent_sum = 0.0
+        desc_max_alpha_sum = 0.0
+        desc_raw_ent_sum = 0.0
+        desc_samples = 0
+        # 在线方差：加权后描述嵌入在区域间的离散度（回答池化是否坍缩方差）
+        desc_online_v_sum = 0.0
+        desc_online_v_samples = 0
+
         # Only show progress bar on rank 0
         if self.rank == 0:
             progress_bar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}")
@@ -540,6 +696,23 @@ class UnifiedTrainer:
             
             self.optimizer.step()
             
+            # ---- V1-A: 采样描述选择的熵（每 desc_stats_every 步一次，避免每步同步） ----
+            if (self.rank == 0 and desc_stats_every > 0
+                    and batch_idx % desc_stats_every == 0
+                    and isinstance(outputs, dict)
+                    and outputs.get('description_attention') is not None):
+                _st = _desc_attention_stats(outputs['description_attention'])
+                if _st is not None:
+                    desc_norm_ent_sum += _st[0]
+                    desc_max_alpha_sum += _st[1]
+                    desc_raw_ent_sum += _st[2]
+                    desc_samples += 1
+                _ov = outputs.get('desc_online_variance')
+                if _ov is not None:
+                    desc_online_v_sum += float(_ov.detach().item()
+                                               if hasattr(_ov, 'detach') else _ov)
+                    desc_online_v_samples += 1
+
             # Update metrics
             total_loss += loss.item()
             seg_loss_total += seg_loss.item()
@@ -563,7 +736,36 @@ class UnifiedTrainer:
         avg_loss = total_loss / len(self.train_loader)
         avg_seg_loss = seg_loss_total / len(self.train_loader)
         avg_cont_loss = cont_loss_total / len(self.train_loader)
-        
+
+        # ---- V1-A: 输出描述选择的熵统计 ----
+        if self.rank == 0 and desc_samples > 0:
+            _ne = desc_norm_ent_sum / desc_samples
+            _ma = desc_max_alpha_sum / desc_samples
+            _re = desc_raw_ent_sum / desc_samples
+            _gs = (self.epoch + 1) * len(self.train_loader)
+            try:
+                self.writer.add_scalar('Desc/norm_entropy', _ne, _gs)
+                self.writer.add_scalar('Desc/max_alpha', _ma, _gs)
+                self.writer.add_scalar('Desc/raw_entropy', _re, _gs)
+            except Exception:
+                pass
+            _verdict = '均匀(未选择)' if _ne > 0.97 else ('塌缩' if _ne < 0.35 else '有区分度')
+            print(f"  [V1-A] 描述选择: 归一化熵={_ne:.4f} (1=均匀, 0=塌缩到单条) "
+                  f"max_alpha={_ma:.4f} 原始熵={_re:.4f} | 采样{desc_samples}次 -> {_verdict}")
+        elif self.rank == 0 and desc_samples == 0:
+            print("  [V1-A] 描述选择: 本 epoch 未采到 description_attention"
+                  f"（mode={self.config.get('model', {}).get('description_selector', {}).get('mode', 'n/a')}）")
+
+        if self.rank == 0 and desc_online_v_samples > 0:
+            _ov = desc_online_v_sum / desc_online_v_samples
+            try:
+                self.writer.add_scalar('Desc/online_V', _ov,
+                                       (self.epoch + 1) * len(self.train_loader))
+            except Exception:
+                pass
+            print(f"  [V1-A] 加权后描述嵌入区域间方差={_ov:.4f} "
+                  f"(mean 模式理论为 0；显著大于 0 说明条件加权保住了多样性)")
+
         return avg_loss, avg_seg_loss, avg_cont_loss
     
     def validate(self):
@@ -848,10 +1050,20 @@ def train_worker(rank, world_size, config, resume_path=None):
                 # Remove 'module.' prefix for single GPU
                 state_dict = {k[7:]: v for k, v in state_dict.items()}
             
-            trainer.model.load_state_dict(state_dict)
-            trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if trainer.scheduler and checkpoint['scheduler_state_dict']:
-                trainer.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            # warm-start: 旧 checkpoint 缺少新增模块（如 description_selector）时允许部分加载
+            warm_start = bool(config.get('training', {}).get('warm_start', False))
+            missing, unexpected = load_model_state_flexible(
+                trainer.model, state_dict, strict=not warm_start, verbose=(rank == 0))
+
+            if warm_start and missing:
+                # 新增模块是随机初始化的，优化器/调度器状态维度已不匹配，必须丢弃。
+                if rank == 0:
+                    print("[warm-start] 检测到新增模块，跳过 optimizer/scheduler 状态恢复，"
+                          "epoch 从 checkpoint 继续但优化器从头开始。")
+            else:
+                trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if trainer.scheduler and checkpoint['scheduler_state_dict']:
+                    trainer.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             trainer.epoch = checkpoint['epoch']
             trainer.best_val_aiou = checkpoint.get('best_val_aiou', checkpoint.get('best_val_iou', 0.0))
             trainer.best_val_loss = checkpoint['best_val_loss']
@@ -931,10 +1143,16 @@ def main():
         # Resume from checkpoint if specified
         if args.resume:
             checkpoint = load_checkpoint(args.resume)
-            trainer.model.load_state_dict(checkpoint['model_state_dict'])
-            trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if trainer.scheduler and checkpoint['scheduler_state_dict']:
-                trainer.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            warm_start = bool(config.get('training', {}).get('warm_start', False))
+            missing, unexpected = load_model_state_flexible(
+                trainer.model, checkpoint['model_state_dict'],
+                strict=not warm_start, verbose=True)
+            if warm_start and missing:
+                print("[warm-start] 检测到新增模块，跳过 optimizer/scheduler 状态恢复。")
+            else:
+                trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if trainer.scheduler and checkpoint['scheduler_state_dict']:
+                    trainer.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             trainer.epoch = checkpoint['epoch']
             trainer.best_val_aiou = checkpoint.get('best_val_aiou', checkpoint.get('best_val_iou', 0.0))
             trainer.best_val_loss = checkpoint['best_val_loss']

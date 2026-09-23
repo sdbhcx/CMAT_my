@@ -72,6 +72,34 @@ class LASModel(nn.Module):
         else:
             raise ValueError(f"Unsupported prompt_type: {self.prompt_type}. Must be 'visual' or 'text'.")
         
+        # ---- V1-A: 固定描述池 + 区域条件选择（描述残差支路） ----
+        # 原始查询继续以完整 token 序列进入 co-attention；
+        # 描述池只经区域残差支路提供补充信息，且不改动原输出键。
+        desc_cfg = config['model'].get('description_selector', {}) or {}
+        self.desc_cfg = desc_cfg
+        self.desc_mode = str(desc_cfg.get('mode', 'off') or 'off').lower()
+        if self.desc_mode not in ('off', 'mean', 'conditional'):
+            raise ValueError(
+                f"Unsupported description_selector.mode: {self.desc_mode}. "
+                f"Must be one of ['off', 'mean', 'conditional'].")
+        # 描述编码方式：
+        #   pooled  逐条编码后再（条件）加权 —— V1-A 原设计
+        #   concat  拼成整句一次编码        —— Aff3DFunc 功能文本增强的做法
+        # 论文指出逐条编码再池化会把类内方差 0.58 压到 0.29、类间可分性 0.34
+        # 压到 0.13；但那是**均匀**池化。条件加权（每个区域取不同权重）是否同样
+        # 受损，由 B2 vs B3 实验回答，并由在线方差诊断直接观测。
+        self.desc_encoding = str(desc_cfg.get('encoding', 'pooled') or 'pooled').lower()
+        if self.desc_encoding not in ('pooled', 'concat'):
+            raise ValueError(
+                f"Unsupported description_selector.encoding: {self.desc_encoding}. "
+                f"Must be one of ['pooled', 'concat'].")
+        self.description_count = int(
+            (config.get('data', {}) or {}).get('description_count', 4))
+        self.text_eval_when_frozen = bool(
+            (config['model'].get('text_encoder', {}) or {}).get('eval_when_frozen', True))
+        self.description_selector = None
+        self.desc_text_encoder = None
+
         # Unified sequence parameters
         self.unified_dim = config['model']['unified_sequence']['unified_dim']
         
@@ -107,9 +135,70 @@ class LASModel(nn.Module):
             dropout=config['model']['segmentation_head']['dropout']
         )
         
+        if self.desc_mode != 'off':
+            self._build_description_branch(config)
+
         # Initialize weights
         self.init_weights()
     
+    def _build_description_branch(self, config):
+        """构造描述文本编码器与区域条件选择器。
+
+        - prompt_type == 'text' 时复用同一份 RoBERTa，避免重复加载一份权重。
+        - 其他情况（visual prompt）单独构造一个 RoBERTa 只用于描述编码。
+        """
+        from .conditional_text_selector import build_description_selector
+
+        text_cfg = config['model'].get('text_encoder', {}) or {}
+        if not text_cfg:
+            raise ValueError(
+                "启用 description_selector 需要 model.text_encoder 配置（RoBERTa）。")
+
+        if self.prompt_type == 'text' and isinstance(self.prompt_encoder, RobertaTextEncoder):
+            self.desc_text_encoder = self.prompt_encoder
+        else:
+            self.desc_text_encoder = RobertaTextEncoder(
+                model_name=text_cfg.get('model_name', 'roberta-base'),
+                frozen=text_cfg.get('frozen', True),
+                finetune_layers=text_cfg.get('finetune_layers', 2),
+                max_length=text_cfg.get('max_length', 128),
+                local_model_path=text_cfg.get('local_model_path', None),
+            )
+
+        self.description_selector = build_description_selector(
+            geom_dim=self.unified_dim,
+            text_dim=self.desc_text_encoder.feature_dim,
+            cfg=self.desc_cfg,
+        )
+        print(f"[LASModel] description_selector 已启用: mode={self.desc_mode}, "
+              f"encoding={self.desc_encoding}, "
+              f"M={self.description_count}, d={self.description_selector.hidden_dim}, "
+              f"text_dim={self.description_selector.text_dim}, "
+              f"shared_text_encoder={self.desc_text_encoder is self.prompt_encoder}")
+
+    def _frozen_text_encoders(self):
+        """返回需要固定为 eval 的冻结文本编码器（按 id 去重）。"""
+        encoders = []
+        seen = set()
+        for enc in (self.prompt_encoder, self.desc_text_encoder):
+            if isinstance(enc, RobertaTextEncoder) and getattr(enc, 'frozen', False):
+                if id(enc) not in seen:
+                    seen.add(id(enc))
+                    encoders.append(enc)
+        return encoders
+
+    def train(self, mode=True):
+        """切换到训练模式。
+
+        requires_grad=False 并不会关闭 dropout，因此这里显式把**冻结的文本子模块**
+        固定为 eval（B0-controlled 对照组）。不关闭其他模块的 dropout。
+        """
+        super().train(mode)
+        if mode and self.text_eval_when_frozen:
+            for enc in self._frozen_text_encoders():
+                enc.eval()
+        return self
+
     def init_weights(self):
         """Initialize model weights"""
         # Initialize type embeddings
@@ -177,6 +266,15 @@ class LASModel(nn.Module):
         # Project to unified dimension
         prompt_features_proj = self.prompt_projection(prompt_features) if prompt_features is not None else None
         point_features_proj = self.point_projection(point_group_features)
+
+        # ---- V1-A: 描述残差支路（放在点投影之后、feature propagation 之前） ----
+        # off 时不构造、不调用；mean/conditional 时 G' = G + delta。
+        description_attention = None
+        desc_online_v = None
+        if self.description_selector is not None:
+            delta, description_attention, desc_online_v = self._apply_description_branch(
+                point_features_proj, batch)
+            point_features_proj = point_features_proj + delta
         
         # Upsample point features
         points_transposed = points.transpose(1, 2).contiguous()
@@ -313,8 +411,102 @@ class LASModel(nn.Module):
             'point_features': fused_point_features,
             'prompt_features': fused_prompt_features
         }
+        if description_attention is not None:
+            # 仅用于诊断：注意力权重不是忠实解释，不能直接当可解释性证据。
+            outputs['description_attention'] = description_attention
+        if desc_online_v is not None:
+            # 诊断：加权后描述嵌入在区域间的离散度，用于回答
+            # 「条件加权是否避免了 Aff3DFunc 指出的池化方差坍缩」。
+            outputs['desc_online_variance'] = desc_online_v
         
         return outputs
+
+    def _apply_description_branch(self, geom_features, batch):
+        """编码描述池并在区域 token 上做条件选择。
+
+        Args:
+            geom_features: [B,R,D] 点投影后的区域特征
+            batch: 必须包含
+                - 'descriptions':      List[List[str]]，长度 B，每行 M 条
+                - 'description_valid': BoolTensor [B,M]
+        Returns:
+            delta: [B,R,D] 残差
+            alpha: [B,R,M] 选择权重
+        """
+        if 'descriptions' not in batch:
+            raise KeyError(
+                f"description_selector 处于 '{self.desc_mode}' 模式，但 batch 缺少 'descriptions'；"
+                "请确认数据集已接入固定描述池。")
+        if 'description_valid' not in batch:
+            raise KeyError(
+                f"description_selector 处于 '{self.desc_mode}' 模式，但 batch 缺少 'description_valid'。")
+
+        desc_groups = batch['descriptions']
+        desc_valid = batch['description_valid']
+
+        if len(desc_groups) != geom_features.shape[0]:
+            raise ValueError(
+                f"descriptions 行数 {len(desc_groups)} 与 batch 大小 {geom_features.shape[0]} 不一致")
+        m = len(desc_groups[0])
+        if m == 0:
+            raise ValueError("descriptions 每行至少需要 1 条描述（M>=1）")
+        if any(len(row) != m for row in desc_groups):
+            raise ValueError("descriptions 各行长度不一致；固定池要求统一 M")
+        if desc_valid.shape != (len(desc_groups), m):
+            raise ValueError(
+                f"description_valid 形状应为 ({len(desc_groups)}, {m})，收到 {tuple(desc_valid.shape)}")
+
+        if self.desc_encoding == 'concat':
+            return self._apply_description_branch_concat(geom_features, desc_groups, desc_valid)
+
+        flat = [text for row in desc_groups for text in row]
+        pooled = self.desc_text_encoder.encode_pooled(flat)          # [B*M, E]
+        desc_emb = pooled.view(len(desc_groups), m, -1)              # [B,M,E]
+
+        delta, alpha = self.description_selector(geom_features, desc_emb, desc_valid)
+        online_v = self._online_agg_variance(alpha, desc_emb)
+        return delta, alpha, online_v
+
+    @staticmethod
+    @torch.no_grad()
+    def _online_agg_variance(alpha, desc_emb):
+        """加权后描述嵌入在区域间的离散程度。
+
+        Aff3DFunc 指出逐条编码再池化会压低类内方差（0.58 -> 0.29）。
+        但那是均匀池化：本方法的 alpha 由区域几何决定，不同区域看到的
+        是不同权重的描述组合，因此这个量应当显著大于 0。
+        mean 模式下各区域权重相同 -> 理论值 0。
+        """
+        if alpha is None or desc_emb is None:
+            return None
+        agg = torch.matmul(alpha.detach(), desc_emb.detach())     # [B,R,E]
+        agg = torch.nn.functional.normalize(agg, dim=-1)
+        r = agg.shape[1]
+        if r < 2:
+            return torch.zeros((), device=agg.device)
+        sim = torch.bmm(agg, agg.transpose(1, 2))                 # [B,R,R]
+        iu = torch.triu_indices(r, r, offset=1, device=agg.device)
+        return (1.0 - sim[:, iu[0], iu[1]]).mean()
+
+    def _apply_description_branch_concat(self, geom_features, desc_groups, desc_valid):
+        """把有效描述拼成一句再编码（Aff3DFunc 的先拼后编）。
+
+        拼接后描述数退化为 1，valid 取「该行是否存在有效描述」。
+        注意：拼接文本远长于单条，需保证 text_encoder.max_length 足够，
+        否则会被截断——论文把「编码器上下文长度」列为主要局限之一。
+        """
+        valid_list = desc_valid.tolist()
+        joined = []
+        for row, flags in zip(desc_groups, valid_list):
+            parts = [t.strip() for t, ok in zip(row, flags)
+                     if ok and isinstance(t, str) and t.strip()]
+            joined.append(" ".join(parts))
+        pooled = self.desc_text_encoder.encode_pooled(joined)        # [B, E]
+        desc_emb = pooled.unsqueeze(1)                               # [B,1,E]
+        concat_valid = desc_valid.any(dim=1, keepdim=True)           # [B,1]
+        delta, alpha = self.description_selector(geom_features, desc_emb, concat_valid)
+        online_v = self._online_agg_variance(alpha, desc_emb)
+        return delta, alpha, online_v
 
 class DinoImageEncoder(nn.Module):
     """
@@ -466,6 +658,8 @@ class RobertaTextEncoder(nn.Module):
         self.model_name = model_name
         self.max_length = max_length
         self.local_model_path = local_model_path
+        # 冻结标记：requires_grad=False 不会关闭 dropout，显式记录以便 train() 里固定为 eval。
+        self.frozen = bool(frozen)
         
         # Load RoBERTa model and tokenizer
         if local_model_path is not None:
@@ -550,6 +744,47 @@ class RobertaTextEncoder(nn.Module):
         features = outputs.last_hidden_state  # (B, seq_len, feature_dim)
         
         return features, attention_mask
+
+    def encode_pooled(self, texts, exclude_special=True):
+        """对整段文本做 masked mean pooling，返回单一向量。
+
+        用于固定描述池：描述池只提供补充信息，不进入原 co-attention 的 token 序列，
+        因此这里把它压成 [B, E] 的句向量，再由区域条件选择器加权。
+
+        Args:
+            texts: List[str]，长度 B（调用方自行展平 B*M）
+            exclude_special: 是否剔除 RoBERTa 的 <s> / </s>。
+                该规则固定为一个版本并写入缓存 key；这里默认剔除。
+
+        Returns:
+            pooled: (B, feature_dim)
+        """
+        # 冻结时不需要梯度，省显存；未冻结时保留计算图，不悄悄改行为。
+        if self.frozen:
+            with torch.no_grad():
+                return self._pooled_impl(texts, exclude_special)
+        return self._pooled_impl(texts, exclude_special)
+
+    def _pooled_impl(self, texts, exclude_special):
+        features, attention_mask = self.forward(texts)  # (B,L,E), (B,L)
+        mask = attention_mask.to(dtype=torch.bool)
+
+        if exclude_special:
+            # RoBERTa：<s> 在位置 0，</s> 在最后一个有效位置。
+            mask = mask.clone()
+            mask[:, 0] = False
+            lengths = attention_mask.sum(dim=1)
+            last_idx = (lengths - 1).clamp(min=0)
+            rows = torch.arange(mask.size(0), device=mask.device)
+            mask[rows, last_idx] = False
+            # 若剔除特殊 token 后该行已无有效 token，退回到"全部非 padding token"
+            empty_rows = ~mask.any(dim=1)
+            if bool(empty_rows.any()):
+                mask[empty_rows] = attention_mask.to(dtype=torch.bool)[empty_rows]
+
+        denom = mask.sum(dim=1, keepdim=True).clamp(min=1).to(features.dtype)
+        pooled = (features * mask.unsqueeze(-1).to(features.dtype)).sum(dim=1) / denom
+        return pooled
 
 class PointMAEEncoder(nn.Module):
     """

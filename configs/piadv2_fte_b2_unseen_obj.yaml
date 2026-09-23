@@ -1,0 +1,133 @@
+# 设定：Unseen_obj
+# 由 configs/piadv2_fte_b2.yaml (Seen) 派生；
+# 与 Seen 版逐字一致，仅 setting_type 与 paths.data_root 不同。
+# 训练集 = Unseen_obj/Point_train.txt，评测集 = Unseen_obj/Point_test.txt
+# （该数据集无 val 划分；piadv2 的验证集本就复用 test split）
+# =============================================================================
+# V1-A.FTE 消融 B2：问句查询 + 四视角描述池 + **区域条件选择**（conditional）
+#
+# alpha = softmax(U V^T / sqrt(d))，U 来自区域几何，
+# 每个区域按自身几何取不同权重的描述组合 —— 本文的主张。
+# 与 B3 的对照直接回答：条件加权是否避免了池化的方差坍缩。
+# =============================================================================
+
+model:
+  name: 'las'
+  prompt_type: 'text'  # 文本查询（RoBERTa）
+
+  # Text prompt encoder (RoBERTa)
+  text_encoder:
+    model_name: 'roberta-base'
+    local_model_path: '/home/junbo/wyn/model/roberta-base'
+    frozen: false
+    finetune_layers: 2
+    max_length: 128
+    # 冻结的文本编码器强制 eval（关闭 dropout），保证对照组的确定性
+    eval_when_frozen: true
+
+  # 固定描述池 + 区域条件选择：B0 关闭
+  description_selector:
+    mode: 'conditional'  # off | mean | conditional
+    encoding: 'pooled'  # pooled 逐条编码 | concat 拼整句后编码
+    hidden_dim: 256
+    temperature: 1.0
+    zero_init_output: true
+    lr_scale: 1.0
+
+  # Image encoder (DINOv3) -- prompt_type: 'text' 下不参与计算
+  image_encoder:
+    model_name: 'dinov3_vitb16'
+    frozen: false
+    finetune_layers: 2
+    dino_local_repo: '/home/junbo/wyn/model/dinov3'
+    dino_local_weights_name: '/home/junbo/wyn/model/dinov3_vitb16/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth'
+
+  # Point encoder (Point-MAE)
+  point_encoder:
+    embed_dim: 384
+    depth: 12
+    num_heads: 6
+    group_size: 32
+    num_group: 128
+    mask_ratio: 0.0
+    pretrain: true
+    pretrain_path: 'pointmae/pretrain.pth'
+    frozen: false
+
+  unified_sequence:
+    unified_dim: 512
+
+  co_attention:
+    num_heads: 8
+    num_layers: 6
+    dim_feedforward: 1024
+    dropout: 0.1
+
+  segmentation_head:
+    hidden_dim: 256
+    num_layers: 3
+    dropout: 0.1
+
+dataset_type: 'piadv2'
+
+data:
+  image_size: [224, 224]
+  num_points: 2048
+  use_augmentation: true
+  # 主查询文本来源：question 问句查询 | affordance_word | hk | ok
+  text_source: 'question'
+  question_bank_path: 'configs/piadv2_question_bank_v1.csv'
+  question_missing: 'error'   # 组合缺项直接报错，禁止静默回退
+  # 四视角功能文本池（Aff3DFunc FTE）：24 类 x 4 视角 x 2 条 = 8 条
+  # 视角：action / function / appearance / environment
+  description_bank_path: 'configs/description_bank_v2.json'
+  description_count: 8
+  missing_description: 'error'   # 描述池缺项时报错，禁止静默补入
+  on_bad_sample: 'zeros'         # 'zeros' 兜底 | 'error' 直接暴露坏样本
+
+# 实验名（用于生成实验目录）与数据集设置
+name: 'las_v1a_fte_b2'
+setting_type: 'Unseen_obj'
+
+loss:
+  type: 'las_loss'
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  focal_weight: 0.5
+  dice_weight: 1.0
+
+training:
+  batch_size: 4
+  learning_rate: 1e-5
+  weight_decay: 0.01
+  epochs: 100
+  optimizer: 'adamw'
+  scheduler: 'cosine'
+  num_workers: 4
+  # 旧 checkpoint 缺失新增模块时允许部分加载（仅 B1/B2 从 B0 热启动时需要）
+  warm_start: false
+
+  segmentation_loss_weight: 1.0
+  contrastive_loss_weight: 0.1
+
+paths:
+  data_root: '/home/datasets/PIAD2/Unseen_obj'
+  checkpoint_dir: 'checkpoints'
+  log_dir: 'logs'
+
+pair_num: 2
+
+validation:
+  frequency: 1
+  save_best: true
+  patience: 10
+
+logging:
+  log_level: 'INFO'
+  save_frequency: 5
+  print_frequency: 100
+
+hardware:
+  use_cuda: true
+  mixed_precision: false
+  pin_memory: true

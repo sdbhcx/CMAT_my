@@ -134,3 +134,11 @@ ehthumbs.db
 .env.*.local
 *.key
 *.pem
+configs/*
+work/*
+tests/*
+Point-MAE/*
+scripts/*
+.unseen_backup_20260922_150056/*
+.v1a_backup_20260921_171528/*
+.v1afte_backup_20260921_224921/*

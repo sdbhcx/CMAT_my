@@ -150,3 +150,4 @@ tests/
 download_stage0_full.py
 download_missing_categories.py
 cache_stage1_h5.py
+configs/*
